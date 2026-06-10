@@ -1,6 +1,6 @@
 <mxfile host="Electron">
   <diagram name="Page-1" id="fU06MtDRABtbnrPJ92fl">
-    <mxGraphModel dx="1505" dy="1043" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="1" shadow="0">
+    <mxGraphModel dx="2171" dy="1836" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="1" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -377,9 +377,6 @@
         </mxCell>
         <mxCell id="X_fgMO6_WrWnFZ9ox-Kz-120" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontSize=24;fontStyle=1" value="\(&amp;nbsp; \hat{x}_{j} = \frac{x_{j} - \mu_{j}}{\sqrt{\sigma_{j}^{2} + \epsilon}} \)" vertex="1">
           <mxGeometry height="75" width="154.24" x="1058.89" y="927.5" as="geometry" />
-        </mxCell>
-        <mxCell id="X_fgMO6_WrWnFZ9ox-Kz-35" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;rotation=0;fontSize=18;" value="\( Attention(Q,K,V) = Softmax\left( \frac{QK^{T}}{\sqrt{d_{k}}} \right) V&amp;nbsp; \)" vertex="1">
-          <mxGeometry height="44" width="317" x="130" y="1060" as="geometry" />
         </mxCell>
         <mxCell id="UtMOREJ7ge42MyXpRvxZ-141" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;rotation=0;fontSize=16;" value="\( softmax\left( \frac{QK^{T}}{\sqrt{d_{k}}} \right) \)" vertex="1">
           <mxGeometry height="30.302803428354377" width="143.66358442456965" x="1296.8260357853865" y="374.4949957218853" as="geometry" />
