@@ -12,4 +12,4 @@ module purge
 module load GCC/13.3.0 CUDA/13.0.0
 
 mkdir -p logs
-uv run python nonlinear_transformer.py
+uv run python src/nonlinear_transformer.py
