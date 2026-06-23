@@ -43,7 +43,7 @@ train_path = Path('data/processed/train.parquet')
 val_path = Path('data/processed/val.parquet')
 test_path = Path('data/processed/test.parquet')
 
-results_dir = Path('../results/benchmark/ft_transformer_benchmark')
+results_dir = Path('results/benchmark/ft_transformer_benchmark')
 results_dir.mkdir(parents = True, exist_ok = True)
 
 ret_col = 'ret_exc_lead1m'
