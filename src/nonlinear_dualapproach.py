@@ -1,19 +1,3 @@
-"""
-
-The preprocessing stage loads the raw panel, computes multi-horizon
-cumulative return targets, classifies characteristics into market-based (K0)
-and accounting-based (K1) groups, applies column and row level missing data
-filters, adds binary missingness flags, performs cross-sectional median 
-imputation followed by rank normalisation, and saves the processed splits 
-alongside column metadata and a country lookup
-table. The training stage reads the processed parquet files, constructs
-per-month cross-sectional tensors, and trains the Dual Path Transformer across
-five encoding variants. The architecture separates per-firm scoring from
-cross-sectional peer comparison by routing firm embeddings through an
-attention-weighted aggregation module (Path 1) and a per-country sparse
-attention module (Path 2), combining their outputs additively.
-"""
-
 import gc
 import json
 import math
@@ -1471,10 +1455,43 @@ def train_variant(config):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# Train all five encoding variants in sequence
+# train all five encoding variants in sequence, applying the tuned
+# hyperparameters from results/transformer-hpt/best_params_{variant}.json
+# when available. the json file for each variant is written by the optuna
+# study in hpt_dual_path.py and contains the configuration that achieved
+# the highest validation long short sharpe ratio for that variant.
+
+hpt_dir = cfg.results_dir / "transformer-hpt"
 
 for variant_name in ["linear", "per_feature", "ple", "periodic", "fourier"]:
     cfg.encoding_variant = variant_name
+
+    hpt_path = hpt_dir / f"best_params_{variant_name}.json"
+    if hpt_path.exists():
+        with open(hpt_path, "r") as f:
+            best_params = json.load(f)
+        cfg.d_model = best_params["d_model"]
+        cfg.n_heads = best_params["n_heads"]
+        cfg.n_layers = best_params["n_layers"]
+        cfg.d_ff = best_params["d_ff_derived"]
+        cfg.dropout = best_params["dropout"]
+        cfg.top_k_attention = best_params["top_k_attention"]
+        cfg.n_mlp_layers = best_params["n_mlp_layers"]
+        cfg.lambda_aux = best_params["lambda_aux"]
+        cfg.learning_rate = best_params["lr"]
+        cfg.weight_decay = best_params["weight_decay"]
+        cfg.grad_clip = best_params["grad_clip"]
+        cfg.lambda_3m = best_params["lambda_3m"]
+        cfg.lambda_12m = best_params["lambda_12m"]
+        cfg.lambda_6m = 1.0 - cfg.lambda_3m - cfg.lambda_12m
+        if "periodic_num_freq" in best_params:
+            cfg.periodic_num_freq = best_params["periodic_num_freq"]
+        if "ple_num_bins" in best_params:
+            cfg.ple_num_bins = best_params["ple_num_bins"]
+        print(f"applied tuned hyperparameters for {variant_name} from {hpt_path}")
+    else:
+        print(f"no tuned hyperparameters found at {hpt_path}, using defaults")
+
     train_variant(cfg)
 
 
@@ -2423,7 +2440,7 @@ for variant_name in all_results:
     if variant_name == best_sharpe_variant:
         marker += "  *sharpe"
     print(
-        f"  {variant_name:<12} "
+        f"{variant_name:<12} "
         f"{vs['rank_corr_6m']:>11.4f}  {vs['sharpe_ls']:>13.4f}  "
         f"{ts['corr_6m']:>12.4f}  {ts['sharpe_lo']:>14.4f}  "
         f"{ts['sharpe_ls']:>14.4f}  {ts['vol_ls']:>11.4f}{marker}"
