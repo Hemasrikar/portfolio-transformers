@@ -260,7 +260,7 @@ def portfolio_metrics(rets, ppy, dates=None):
         for y in sorted(set(years.tolist())):
             mask = years == y
             sub = rets[mask]
-            if len(sub) < 2:
+            if len(sub) < 1:
                 continue
             y_ret = float(sub.mean() * ppy)
             y_vol = float(sub.std() * np.sqrt(ppy))
@@ -337,6 +337,51 @@ def _firm_id_turnover(prev_ids, curr_ids):
     return (len(curr - prev) + len(prev - curr)) / max(len(curr), 1)
 
 
+def _weight_l1_turnover(prev_ids, prev_w, curr_ids, curr_w):
+    """L1 distance between two weight vectors aligned by firm identifier.
+    Captures additions, exits, and within-position weight changes in a
+    single measure. When prev_ids is None, returns sum_i |curr_w_i|,
+    namely the entry cost from a flat starting portfolio."""
+    if curr_ids is None or curr_w is None or len(curr_w) == 0:
+        return 0.0
+    curr_map = {}
+    for j in range(len(curr_ids)):
+        fid = int(curr_ids[j]) if not hasattr(curr_ids[j], 'item') else int(curr_ids[j].item())
+        curr_map[fid] = float(curr_w[j])
+    if prev_ids is None or prev_w is None or len(prev_w) == 0:
+        return float(sum(abs(v) for v in curr_map.values()))
+    prev_map = {}
+    for j in range(len(prev_ids)):
+        fid = int(prev_ids[j]) if not hasattr(prev_ids[j], 'item') else int(prev_ids[j].item())
+        prev_map[fid] = float(prev_w[j])
+    all_ids = set(prev_map.keys()) | set(curr_map.keys())
+    return float(sum(
+        abs(curr_map.get(fid, 0.0) - prev_map.get(fid, 0.0)) for fid in all_ids
+    ))
+
+
+def _drift_weights(prev_ids, prev_w, realised_returns_by_id):
+    """Drift a weight vector forward by realised firm-level returns over a
+    holding period. Firms missing from realised_returns_by_id are assigned
+    zero return. Returns (ids_list, drifted_w) or (None, None) if no
+    previous state."""
+    if prev_ids is None or prev_w is None or len(prev_w) == 0:
+        return None, None
+    n = len(prev_w)
+    ids_list = []
+    growth = np.zeros(n, dtype=np.float64)
+    for j in range(n):
+        fid = int(prev_ids[j]) if not hasattr(prev_ids[j], 'item') else int(prev_ids[j].item())
+        ids_list.append(fid)
+        growth[j] = float(prev_w[j]) * (1.0 + float(realised_returns_by_id.get(fid, 0.0)))
+    g_sum = float(growth.sum())
+    if g_sum > 1e-12:
+        drifted = growth / g_sum
+    else:
+        drifted = growth
+    return ids_list, drifted
+
+
 def apply_period_vol_overlay(period_rets, n_vol_pds, ppy, max_lev):
     """Volatility overlay on period returns. Vol is estimated from gross
     returns (before TC deduction) so turnover costs do not suppress the
@@ -408,9 +453,16 @@ def run_mean_split_simulation(predictor, month_dates):
     lo_period_rets, lo_period_dates = [], []
     lo_tc_history = []
 
+    # state for drift-based turnover accounting per leg
     prev_long_ids = None
+    prev_long_w = None
+    prev_long_realised = None
     prev_short_ids = None
+    prev_short_w = None
+    prev_short_realised = None
     prev_lo_ids = None
+    prev_lo_w = None
+    prev_lo_realised = None
 
     ls_holdings, lo_holdings = [], []
     rb_counter = -1
@@ -451,43 +503,67 @@ def run_mean_split_simulation(predictor, month_dates):
         long_w = _renorm_over_valid(long_w, valid[long_idx])
         short_w = _renorm_over_valid(short_w, valid[short_idx])
 
-        long_ret = (
-            float(np.sum(long_w[valid[long_idx]] * r[long_idx][valid[long_idx]]))
-            if long_idx.size else 0.0
-        )
-        short_ret = (
-            float(np.sum(short_w[valid[short_idx]] * r[short_idx][valid[short_idx]]))
-            if short_idx.size else 0.0
-        )
+        # compute leg returns and record per-firm realised returns for
+        # the drift accounting at the next rebalance
+        long_ids_list = long_firm_ids.tolist()
+        short_ids_list = short_firm_ids.tolist()
+        long_realised = {}
+        short_realised = {}
+        long_ret = 0.0
+        for i, fi in enumerate(long_idx):
+            ri = float(r[fi]) if valid[fi] else 0.0
+            long_realised[int(ids[fi])] = ri
+            long_ret += long_w[i] * ri
+        short_ret = 0.0
+        for i, fi in enumerate(short_idx):
+            ri = float(r[fi]) if valid[fi] else 0.0
+            short_realised[int(ids[fi])] = ri
+            short_ret += short_w[i] * ri
         ls_ret = long_ret - short_ret
 
-        # tc is computed per leg then summed for long short, or only for the
-        # long leg for long only. each leg uses its own current size as the
-        # denominator so the normalisation is independent.
-        lt = _firm_id_turnover(prev_long_ids, long_firm_ids)
-        st = _firm_id_turnover(prev_short_ids, short_firm_ids)
+        # drift previous leg weights and compute L1 turnover
+        d_long_ids, d_long_w = _drift_weights(prev_long_ids, prev_long_w, prev_long_realised)
+        d_short_ids, d_short_w = _drift_weights(prev_short_ids, prev_short_w, prev_short_realised)
+        lt = _weight_l1_turnover(d_long_ids, d_long_w, long_ids_list, long_w)
+        st = _weight_l1_turnover(d_short_ids, d_short_w, short_ids_list, short_w)
         ls_flat_tc = (lt + st) * tc_bps / 10000.0
 
         ls_period_rets.append(ls_ret)
         ls_period_dates.append(eom)
         ls_tc_history.append(ls_flat_tc)
-        prev_long_ids = long_firm_ids
-        prev_short_ids = short_firm_ids
+        prev_long_ids = long_ids_list
+        prev_long_w = long_w
+        prev_long_realised = long_realised
+        prev_short_ids = short_ids_list
+        prev_short_w = short_w
+        prev_short_realised = short_realised
 
         lo_w = _capped_softmax_weights(pred[valid_pred], max_position_weight)
         lo_w_full = np.zeros(n_firms, dtype=np.float64)
         lo_w_full[valid_pred] = lo_w
         lo_w_full = _renorm_over_valid(lo_w_full, valid)
-        lo_ret = float(np.sum(lo_w_full[valid] * r[valid]))
-
         lo_firm_ids = ids[valid_pred]
-        lo_turn = _firm_id_turnover(prev_lo_ids, lo_firm_ids)
+        lo_ids_list = lo_firm_ids.tolist()
+        lo_realised = {}
+        lo_ret = 0.0
+        for fi in range(n_firms):
+            ri = float(r[fi]) if valid[fi] else 0.0
+            lo_realised[int(ids[fi])] = ri
+            lo_ret += lo_w_full[fi] * ri
+
+        d_lo_ids, d_lo_w = _drift_weights(prev_lo_ids, prev_lo_w, prev_lo_realised)
+        # the long-only target weights need to be expressed over the same
+        # id space as the drifted previous weights. lo_w is indexed over
+        # valid_pred positions; expand to the full id list for the L1 calc.
+        lo_turn = _weight_l1_turnover(d_lo_ids, d_lo_w, ids.tolist(), lo_w_full)
         lo_flat_tc = lo_turn * tc_bps / 10000.0
 
         lo_period_rets.append(lo_ret)
         lo_period_dates.append(eom)
         lo_tc_history.append(lo_flat_tc)
-        prev_lo_ids = lo_firm_ids
+        prev_lo_ids = ids.tolist()
+        prev_lo_w = lo_w_full
+        prev_lo_realised = lo_realised
 
         for i, fi in enumerate(long_idx):
             ls_holdings.append({
@@ -569,21 +645,29 @@ def _build_period_rows(model_name, portfolio, scaling, rets, dates):
     return rows
 
 
-def _weighted_monthly_return(weight_dict, id_to_r1m):
-    """Weighted one-month return for a single leg. Weights are renormalised
-    over firms with valid realised one-month returns, so the portfolio
-    stays fully invested when some holdings are unavailable in the current
-    cross section."""
-    total_w = 0.0
+def _drift_weight_dict(weight_dict, id_to_r1m):
+    """Drift a weight dictionary forward by one month of realised returns.
+    Firms absent from id_to_r1m earn zero, causing their drifted weight
+    to decline relative to survivors when the rest of the portfolio is up."""
+    growth = {}
+    for fid, w in weight_dict.items():
+        r = id_to_r1m.get(fid, 0.0)
+        growth[fid] = w * (1.0 + r)
+    g_sum = sum(growth.values())
+    if g_sum > 1e-12:
+        return {fid: v / g_sum for fid, v in growth.items()}
+    return growth
+
+
+def _weighted_return_from_dict(weight_dict, id_to_r1m):
+    """Weighted one-month return for a single leg using drifted weights.
+    No renormalisation is applied because the drifted weights already
+    sum to one over the surviving positions."""
     ret = 0.0
     for fid, w in weight_dict.items():
-        r = id_to_r1m.get(fid)
-        if r is not None:
-            ret += w * r
-            total_w += w
-    if total_w <= 1e-12:
-        return 0.0
-    return ret / total_w
+        r = id_to_r1m.get(fid, 0.0)
+        ret += w * r
+    return ret
 
 
 def run_mean_split_simulation_monthly(predictor, month_dates):
@@ -591,13 +675,11 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
 
     At each rebalance (every rebalance_freq months) new weights are formed
     from the MLP's six-month predictions using _capped_softmax_weights and
-    the mean split construction. Between rebalances the same weights are held
-    and a one-month gross return is recorded for every calendar month using
-    ret_exc_lead1m (r1m). TC is charged only at rebalance months and stored
-    separately so the vol overlay is estimated from gross returns.
-
-    Returns gross monthly return arrays and TC arrays alongside rebalance
-    indices into those arrays, for both long-short and long-only portfolios."""
+    the mean split construction. Between rebalances the weights drift
+    buy-and-hold so the monthly cumulative compounds to the same six month
+    buy-and-hold return at each rebalance boundary. TC is charged only at
+    rebalance months. L1 weight turnover is computed against the drifted
+    previous weights so weight changes among held positions are costed."""
     ls_monthly_rets, ls_monthly_tc, ls_monthly_dates, ls_rb_indices = [], [], [], []
     lo_monthly_rets, lo_monthly_tc, lo_monthly_dates, lo_rb_indices = [], [], [], []
 
@@ -606,8 +688,11 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
     lo_weight_dict = {}
 
     prev_long_ids = None
+    prev_long_w = None
     prev_short_ids = None
+    prev_short_w = None
     prev_lo_ids = None
+    prev_lo_w = None
 
     for pos, eom in enumerate(month_dates):
         if eom not in all_months:
@@ -640,20 +725,50 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
                 sw = _capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
                 low = _capped_softmax_weights(pred[valid_pred], max_position_weight)
 
-                lt = _firm_id_turnover(prev_long_ids, new_long_ids)
-                st = _firm_id_turnover(prev_short_ids, new_short_ids)
-                lo_turn = _firm_id_turnover(prev_lo_ids, new_lo_ids)
+                # snapshot drifted previous weights for L1 turnover before
+                # overwriting with new targets
+                prev_drifted_long_ids = (
+                    list(long_weight_dict.keys()) if long_weight_dict else None
+                )
+                prev_drifted_long_w = (
+                    list(long_weight_dict.values()) if long_weight_dict else None
+                )
+                prev_drifted_short_ids = (
+                    list(short_weight_dict.keys()) if short_weight_dict else None
+                )
+                prev_drifted_short_w = (
+                    list(short_weight_dict.values()) if short_weight_dict else None
+                )
+                prev_drifted_lo_ids = (
+                    list(lo_weight_dict.keys()) if lo_weight_dict else None
+                )
+                prev_drifted_lo_w = (
+                    list(lo_weight_dict.values()) if lo_weight_dict else None
+                )
+
+                new_long_ids_list = new_long_ids.tolist()
+                new_short_ids_list = new_short_ids.tolist()
+                new_lo_ids_list = new_lo_ids.tolist()
+
+                lt = _weight_l1_turnover(
+                    prev_drifted_long_ids, prev_drifted_long_w,
+                    new_long_ids_list, lw,
+                )
+                st = _weight_l1_turnover(
+                    prev_drifted_short_ids, prev_drifted_short_w,
+                    new_short_ids_list, sw,
+                )
+                lo_turn = _weight_l1_turnover(
+                    prev_drifted_lo_ids, prev_drifted_lo_w,
+                    new_lo_ids_list, low,
+                )
 
                 ls_tc_this = (lt + st) * tc_bps / 10000.0
                 lo_tc_this = lo_turn * tc_bps / 10000.0
 
-                long_weight_dict = dict(zip(new_long_ids.tolist(), lw.tolist()))
-                short_weight_dict = dict(zip(new_short_ids.tolist(), sw.tolist()))
-                lo_weight_dict = dict(zip(new_lo_ids.tolist(), low.tolist()))
-
-                prev_long_ids = new_long_ids
-                prev_short_ids = new_short_ids
-                prev_lo_ids = new_lo_ids
+                long_weight_dict = dict(zip(new_long_ids_list, lw.tolist()))
+                short_weight_dict = dict(zip(new_short_ids_list, sw.tolist()))
+                lo_weight_dict = dict(zip(new_lo_ids_list, low.tolist()))
 
                 ls_rb_indices.append(len(ls_monthly_rets))
                 lo_rb_indices.append(len(lo_monthly_rets))
@@ -667,9 +782,9 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
             if valid_r1m[k]
         }
 
-        long_ret = _weighted_monthly_return(long_weight_dict, id_to_r1m)
-        short_ret = _weighted_monthly_return(short_weight_dict, id_to_r1m)
-        lo_ret = _weighted_monthly_return(lo_weight_dict, id_to_r1m)
+        long_ret = _weighted_return_from_dict(long_weight_dict, id_to_r1m)
+        short_ret = _weighted_return_from_dict(short_weight_dict, id_to_r1m)
+        lo_ret = _weighted_return_from_dict(lo_weight_dict, id_to_r1m)
 
         ls_monthly_rets.append(long_ret - short_ret)
         ls_monthly_tc.append(ls_tc_this)
@@ -678,6 +793,13 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
         lo_monthly_rets.append(lo_ret)
         lo_monthly_tc.append(lo_tc_this)
         lo_monthly_dates.append(eom)
+
+        # drift weights forward by this month's realised returns so the
+        # next month uses buy-and-hold weights rather than the original
+        # target weights
+        long_weight_dict = _drift_weight_dict(long_weight_dict, id_to_r1m)
+        short_weight_dict = _drift_weight_dict(short_weight_dict, id_to_r1m)
+        lo_weight_dict = _drift_weight_dict(lo_weight_dict, id_to_r1m)
 
     return {
         'long_short': {
@@ -775,8 +897,8 @@ def rank_correlation_oos(predictor, month_dates):
         if valid.sum() < 10:
             continue
         c, _ = spearmanr(pred[valid], m['r'][valid])
-        if not np.isnan(c):
-            corrs.append(float(c))
+        if not np.isnan(c):                                      #type: ignore
+            corrs.append(float(c))                                 #type: ignore
     return float(np.mean(corrs)) if corrs else 0.0
 
 
@@ -1276,6 +1398,71 @@ for portfolio, scaling, rets, dates in [
 per_period_df = pd.DataFrame(period_rows)
 per_period_df.to_csv(results_dir / 'em_mlp_per_period_metrics.csv', index=False)
 print(f'per period metrics saved, {len(per_period_df)} rows')
+
+
+# monthly simulation. the monthly variant runs on sorted_dates so the
+# vol overlay has full warm up before the test window. the return series
+# is then sliced to the test window for metrics and csv output. the
+# per month csv is the source for the four diagnostic plots (cumulative
+# wealth, drawdown, rolling sharpe, rolling return) at monthly frequency.
+
+mo_sim = run_mean_split_simulation_monthly(mlp_predictor, sorted_dates)
+mo_ls = mo_sim['long_short']
+mo_lo = mo_sim['long_only']
+
+mo_ls_lev = apply_vol_target_monthly(
+    mo_ls['returns'] - mo_ls['tc'], mo_ls['rb_indices'],
+    vol_lookback_months, max_leverage_long_short,
+)
+mo_lo_lev = apply_vol_target_monthly(
+    mo_lo['returns'] - mo_lo['tc'], mo_lo['rb_indices'],
+    vol_lookback_months, max_leverage_long_only,
+)
+
+mo_ls_unscaled_full = mo_ls['returns'] - mo_ls['tc']
+mo_ls_scaled_full = mo_ls_lev * mo_ls['returns'] - mo_ls_lev * mo_ls['tc']
+mo_lo_unscaled_full = mo_lo['returns'] - mo_lo['tc']
+mo_lo_scaled_full = mo_lo_lev * mo_lo['returns'] - mo_lo_lev * mo_lo['tc']
+
+test_set = set(test_dates)
+mo_ls_mask = np.array([d in test_set for d in mo_ls['dates']])
+mo_lo_mask = np.array([d in test_set for d in mo_lo['dates']])
+
+mo_ls_unscaled_test = mo_ls_unscaled_full[mo_ls_mask]
+mo_ls_scaled_test = mo_ls_scaled_full[mo_ls_mask]
+mo_lo_unscaled_test = mo_lo_unscaled_full[mo_lo_mask]
+mo_lo_scaled_test = mo_lo_scaled_full[mo_lo_mask]
+mo_ls_dates_test = [d for d, m in zip(mo_ls['dates'], mo_ls_mask) if m]
+mo_lo_dates_test = [d for d, m in zip(mo_lo['dates'], mo_lo_mask) if m]
+
+mo_ls_unscaled_m = portfolio_metrics(mo_ls_unscaled_test, 12.0, dates=mo_ls_dates_test)
+mo_ls_scaled_m = portfolio_metrics(mo_ls_scaled_test, 12.0, dates=mo_ls_dates_test)
+mo_lo_unscaled_m = portfolio_metrics(mo_lo_unscaled_test, 12.0, dates=mo_lo_dates_test)
+mo_lo_scaled_m = portfolio_metrics(mo_lo_scaled_test, 12.0, dates=mo_lo_dates_test)
+
+print(
+    f'mlp monthly long short scaled: sharpe = {mo_ls_scaled_m["sharpe"]:.4f}, '
+    f'ann_ret = {mo_ls_scaled_m["ann_ret"] * 100:.2f}%, '
+    f'ann_vol = {mo_ls_scaled_m["ann_vol"] * 100:.2f}%'
+)
+print(
+    f'mlp monthly long only scaled: sharpe = {mo_lo_scaled_m["sharpe"]:.4f}, '
+    f'ann_ret = {mo_lo_scaled_m["ann_ret"] * 100:.2f}%, '
+    f'ann_vol = {mo_lo_scaled_m["ann_vol"] * 100:.2f}%'
+)
+
+monthly_rows = []
+for portfolio, scaling, rets, dates in [
+    ('long_short', 'unscaled', mo_ls_unscaled_test, mo_ls_dates_test),
+    ('long_short', 'scaled', mo_ls_scaled_test, mo_ls_dates_test),
+    ('long_only', 'unscaled', mo_lo_unscaled_test, mo_lo_dates_test),
+    ('long_only', 'scaled', mo_lo_scaled_test, mo_lo_dates_test),
+]:
+    monthly_rows.extend(_build_monthly_rows('mlp', portfolio, scaling, rets, dates))
+
+per_month_df = pd.DataFrame(monthly_rows)
+per_month_df.to_csv(results_dir / 'em_mlp_per_month_metrics.csv', index=False)
+print(f'per month metrics saved, {len(per_month_df)} rows')
 
 
 # plots

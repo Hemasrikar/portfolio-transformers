@@ -1,5 +1,5 @@
 
-## Fama-French Five-Factor Benchmark
+## Fama-French Five-Factors Benchmark
 
 import json
 import warnings
@@ -47,7 +47,6 @@ id_cols = ['id', 'eom', 'excntry', ret_col, 'me']
 
 test_start = pd.Timestamp('2021-01-01')
 
-## Load and process
 
 schema = pq.read_schema(data_path)
 all_col_names = schema.names
@@ -102,7 +101,7 @@ for eom in sorted_eoms:
         valid = np.isfinite(vals)
         ranked = np.zeros(len(month))
         if valid.sum() > 5:
-            ranked[valid] = pd.Series(vals[valid]).rank(pct = True).values - 0.5              #type:ignore
+            ranked[valid] = pd.Series(vals[valid]).rank(pct = True).to_numpy() - 0.5 
         fm_vals[cname] = ranked
         fm_valid[cname] = valid
 
@@ -116,7 +115,6 @@ for eom in sorted_eoms:
 
 sorted_dates = sorted(all_months.keys())
 print(f'processed months, {len(sorted_dates)}')
-
 
 def portfolio_metrics(rets, dates = None):
     rets = np.array(rets, dtype = np.float64)
@@ -168,7 +166,6 @@ def portfolio_metrics(rets, dates = None):
 
     return out
 
-
 def apply_vol_target(monthly_rets, rebalance_indices, target_vol, lookback_months, max_leverage):
     scaled = np.array(monthly_rets, dtype = np.float64)
     n = len(monthly_rets)
@@ -187,13 +184,11 @@ def apply_vol_target(monthly_rets, rebalance_indices, target_vol, lookback_month
         )
     return scaled
 
-
 def filter_to_test_window(rets, dates, start_date):
     rets_arr = np.array(rets, dtype = np.float64)
     dates_arr = pd.DatetimeIndex(dates)
     mask = dates_arr >= start_date
     return rets_arr[mask], list(dates_arr[mask])
-
 
 def selected_weight_map(ids, selected_ids, weight_vals = None, gross = 1.0):
     selected_ids = set(selected_ids)
@@ -218,7 +213,6 @@ def selected_weight_map(ids, selected_ids, weight_vals = None, gross = 1.0):
         sid: float(gross * w / weight_sum)
         for sid, w in zip(selected_ids_arr.tolist(), selected_weights)
     }
-
 
 def portfolio_turnover(new_weights, old_weights):
     ids = set(new_weights) | set(old_weights)
@@ -510,9 +504,10 @@ for date_key, p in fm_predictions.items():
     valid_corr = np.isfinite(p['w']) & np.isfinite(p['r'])
     if valid_corr.sum() < 10:
         continue
-    c, _ = spearmanr(p['w'][valid_corr], p['r'][valid_corr])
-    if not np.isnan(c):                                                #type:ignore
-        fm_corrs.append(float(c))                                    #type:ignore
+    result = spearmanr(p['w'][valid_corr], p['r'][valid_corr])
+    c = result.statistic                                             # pyright: ignore[reportAttributeAccessIssue]
+    if not np.isnan(c):
+        fm_corrs.append(float(c))
 fm_rc = float(np.mean(fm_corrs)) if fm_corrs else 0.0
 print(f'FM rank correlation, {fm_rc:.4f}')
 
@@ -690,41 +685,20 @@ def _build_monthly_rows(strategy, portfolio, scaling, rets, dates):
         })
     return rows
 
-
 monthly_rows = []
-monthly_rows.extend(_build_monthly_rows(
-    'market_value_weighted', 'long_only', 'unscaled', market_rets, market_dates_test,
-))
-monthly_rows.extend(_build_monthly_rows(
-    'market_value_weighted', 'long_only', 'scaled', market_scaled, market_dates_test,
-))
+monthly_rows.extend(_build_monthly_rows('market_value_weighted', 'long_only', 'unscaled', market_rets, market_dates_test))
+monthly_rows.extend(_build_monthly_rows('market_value_weighted', 'long_only', 'scaled', market_scaled, market_dates_test))
 
 for fname, fr in factor_results.items():
-    monthly_rows.extend(_build_monthly_rows(
-        fname, 'long_short', 'unscaled', fr['returns_ls_unscaled'], fr['dates_ls'],
-    ))
-    monthly_rows.extend(_build_monthly_rows(
-        fname, 'long_short', 'scaled', fr['returns_ls_scaled'], fr['dates_ls'],
-    ))
-    monthly_rows.extend(_build_monthly_rows(
-        fname, 'long_only', 'unscaled', fr['returns_lo_unscaled'], fr['dates_lo'],
-    ))
-    monthly_rows.extend(_build_monthly_rows(
-        fname, 'long_only', 'scaled', fr['returns_lo_scaled'], fr['dates_lo'],
-    ))
+    monthly_rows.extend(_build_monthly_rows(fname, 'long_short', 'unscaled', fr['returns_ls_unscaled'], fr['dates_ls']))
+    monthly_rows.extend(_build_monthly_rows(fname, 'long_short', 'scaled', fr['returns_ls_scaled'], fr['dates_ls']))
+    monthly_rows.extend(_build_monthly_rows(fname, 'long_only', 'unscaled', fr['returns_lo_unscaled'], fr['dates_lo']))
+    monthly_rows.extend(_build_monthly_rows(fname, 'long_only', 'scaled', fr['returns_lo_scaled'], fr['dates_lo']))
 
-monthly_rows.extend(_build_monthly_rows(
-    'fm_regression', 'long_short', 'unscaled', fm_ls_rets, fm_ls_dates_test,
-))
-monthly_rows.extend(_build_monthly_rows(
-    'fm_regression', 'long_short', 'scaled', fm_ls_scaled, fm_ls_dates_test,
-))
-monthly_rows.extend(_build_monthly_rows(
-    'fm_regression', 'long_only', 'unscaled', fm_lo_rets, fm_lo_dates_test,
-))
-monthly_rows.extend(_build_monthly_rows(
-    'fm_regression', 'long_only', 'scaled', fm_lo_scaled, fm_lo_dates_test,
-))
+monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_short', 'unscaled', fm_ls_rets, fm_ls_dates_test))
+monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_short', 'scaled', fm_ls_scaled, fm_ls_dates_test))
+monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_only', 'unscaled', fm_lo_rets, fm_lo_dates_test))
+monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_only', 'scaled', fm_lo_scaled, fm_lo_dates_test))
 
 per_month_df = pd.DataFrame(monthly_rows)
 per_month_df.to_csv(results_dir / 'ff_per_month_metrics.csv', index = False)
@@ -737,7 +711,6 @@ def _strip_per_year(m):
     return {k: v for k, v in m.items() if k != 'per_year'}
 
 summary = {
-    'universe': 'EM',
     'fm_characteristics': fm_available,
     'test_start': str(test_start.date()),
     'market_long_only_unscaled': _strip_per_year(mkt_m),
@@ -763,10 +736,9 @@ summary = {
         'rank_corr': fm_rc, 'n_oos_months': len(fm_predictions),
     },
 }
-with open(results_dir / 'ff_summary.json', 'w') as fh:
-    json.dump(summary, fh, indent = 2, default = float)
+with open(results_dir / 'ff_summary.json', 'w') as fs:
+    json.dump(summary, fs, indent = 2, default = float)
 print(f'summary json saved')
-
 
 def _row(strategy, portfolio, scaling, m):
     return {
@@ -779,7 +751,6 @@ def _row(strategy, portfolio, scaling, m):
 
 
 summary_rows = []
-
 for scaling, mk in [
     ('unscaled', mkt_m),
     ('scaled', mkt_m_scaled),
@@ -808,23 +779,12 @@ for portfolio, scaling, m in [
 summary_table = pd.DataFrame(summary_rows)
 print('Fama-French Benchmark, EM Universe, Unscaled and vol-targeted')
 print(summary_table.to_string(index = False))
-print(f'\nFM rank correlation, {fm_rc:.4f}')
+print(f'FM rank correlation, {fm_rc:.4f}')
 
-# save the consolidated summary for downstream comparison
 summary_table.to_csv(results_dir / 'fama_french_summary.csv', index = False)
 print('summary saved, fama_french_summary.csv')
 
 
-plt.rcParams.update({
-    'font.family': 'serif',
-    'mathtext.fontset': 'cm',
-    'font.size': 10,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'pdf.fonttype': 42,
-})
 factor_order = ['value', 'momentum', 'profitability', 'investment', 'size']
 # figure 1, volatility targeted cumulative wealth
 fig, axes = plt.subplots(1, 2, figsize = (12, 4))
@@ -841,24 +801,17 @@ ax.legend(frameon = False)
 ax = axes[1]
 for factor in factor_order:
     if factor in factor_results:
-        ax.plot(
-            np.cumprod(1 + factor_results[factor]['returns_lo_scaled']),
-            label = factor.title(),
-        )
+        ax.plot(np.cumprod(1 + factor_results[factor]['returns_lo_scaled']), label = factor.title())
 ax.set_xlabel('Months from Start of Sample')
 ax.set_ylabel('Cumulative Wealth')
 ax.set_title('Single Factor Long Only, Volatility Targeted')
 ax.legend(frameon = False)
 
 fig.tight_layout()
-fig.savefig(results_dir / 'ff_cumulative_scaled.pdf')
-fig.savefig(results_dir / 'ff_cumulative_scaled.png')
 plt.show()
-plt.close(fig)
 
 
 # figure 2, unscaled cumulative wealth
-
 fig, axes = plt.subplots(1, 2, figsize = (12, 4))
 
 ax = axes[0]
@@ -873,26 +826,17 @@ ax.legend(frameon = False)
 ax = axes[1]
 for factor in factor_order:
     if factor in factor_results:
-        ax.plot(
-            np.cumprod(1 + factor_results[factor]['returns_lo_unscaled']),
-            label = factor.title(),
-        )
+        ax.plot(np.cumprod(1 + factor_results[factor]['returns_lo_unscaled']), label = factor.title())
 ax.set_xlabel('Months')
 ax.set_ylabel('Cumulative Wealth')
 ax.set_title('Single Factor Long Only, Unscaled')
 ax.legend(frameon = False)
 
 fig.tight_layout()
-fig.savefig(results_dir / 'ff_cumulative_unscaled.pdf')
-fig.savefig(results_dir / 'ff_cumulative_unscaled.png')
 plt.show()
-plt.close(fig)
 
 
 # figure 3, volatility targeted against unscaled on the same axes.
-# scaled and unscaled of the same strategy share a colour so that the pair
-# is visually identifiable. the scaled line is solid and the unscaled is dashed.
-
 fig, axes = plt.subplots(1, 2, figsize = (12, 4))
 
 ax = axes[0]
@@ -919,7 +863,4 @@ ax.set_title('Single Factor Long Only, Solid Scaled, Dashed Unscaled')
 ax.legend(frameon = False, fontsize = 9, loc = 'upper left')
 
 fig.tight_layout()
-fig.savefig(results_dir / 'ff_cumulative_combined.pdf')
-fig.savefig(results_dir / 'ff_cumulative_combined.png')
 plt.show()
-plt.close(fig)
