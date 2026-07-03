@@ -1,0 +1,11 @@
+{
+  "train_start": "1995-01-31",
+  "train_end": "2015-12-31",
+  "n_train_months": 252,
+  "val_start": "2016-01-31",
+  "val_end": "2020-12-31",
+  "n_val_months": 60,
+  "test_start": "2021-01-31",
+  "test_end": "2025-06-30",
+  "n_test_months": 54
+}
