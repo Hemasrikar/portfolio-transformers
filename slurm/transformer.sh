@@ -5,8 +5,8 @@
 #SBATCH --mem-per-cpu=5960
 #SBATCH --gres=gpu:lovelace_l40:1
 #SBATCH --time=48:00:00
-#SBATCH --output=logs-ft/ft_transformer_%j.out
-#SBATCH --error=logs-ft/ft_transformer_%j.err
+#SBATCH --output=logs-transformer/dualapproach_%j.out
+#SBATCH --error=logs-transformer/dualapproach_%j.err
 
 module --force purge
 
@@ -15,5 +15,5 @@ cd /springbrook/share/wbs/bstvvz
 # activate venv
 source .venv/bin/activate
 
-mkdir -p logs-ft
-python src/ft_transformer_benchmark.py
+mkdir -p logs-transformer
+python src/nonlinear_dualapproach.py
