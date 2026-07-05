@@ -1,0 +1,23 @@
+{
+  "d_model": 96,
+  "n_heads": 2,
+  "d_ff_mult": 4,
+  "n_layers": 2,
+  "dropout": 0.28614830534045776,
+  "n_mlp_layers": 1,
+  "lambda_aux": 0.4879639408647978,
+  "lr": 0.002311294500510415,
+  "weight_decay": 1.1526449540315607e-06,
+  "grad_clip": 0.990942339314793,
+  "d_ff_derived": 384,
+  "best_val_sharpe_ls": 3.3554528010893736,
+  "trial_number": 1,
+  "best_epoch": 8,
+  "n_epochs_trained": 16,
+  "best_train_loss": 1.1841931492987594,
+  "best_val_loss": 0.6117654286599797,
+  "best_corr_6m": 0.12409222910258298,
+  "best_base_corr_6m": 0.1240768272303588,
+  "best_adj_corr_6m": -0.08937284937904527,
+  "val_sharpe_ls": 3.3554528010893736
+}
