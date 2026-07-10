@@ -6,6 +6,7 @@ import time
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import typing
 
 import numpy as np
 import pandas as pd
@@ -73,8 +74,8 @@ k0_characteristic_list = [
     'mispricing_mgmt', 'mispricing_perf',
 ]
 
-forward_horizons = [3, 6, 12]
-target_cols = ["target_3m", "target_6m", "target_12m"]
+forward_horizons = [6]
+target_cols = ["target_6m"]
 
 
 @dataclass
@@ -104,16 +105,9 @@ class Config:
     ple_num_bins: int = 16
     periodic_num_freq: int = 32
 
-    # Dual path specific parameters
     n_mlp_layers: int = 2
     lambda_aux: float = 0.3
-    # minimum cross-section size per country before the attention blocks run.
-    # 30 prevents the cross-sectional path from fitting noise on small EM
-    # country buckets; countries below this threshold fall back to the base
-    # MLP path, which is the correct behaviour when peers are too few.
     min_firms_attention: int = 30
-    # linear warmup over the first warmup_epochs epochs stabilises early
-    # transformer training before ReduceLROnPlateau takes control.
     warmup_epochs: int = 5
 
     # Optimiser and training schedule
@@ -122,13 +116,7 @@ class Config:
     max_epochs: int = 100
     patience: int = 15
     grad_clip: float = 1.0
-
-    # Multi-horizon loss weights. 6m receives the largest weight because
-    # 3m returns in EM are dominated by microstructure noise and dilute
-    # the primary prediction signal when weighted equally.
-    lambda_3m: float = 0.1
-    lambda_6m: float = 0.7
-    lambda_12m: float = 0.2
+    n_seeds: int = 5
 
     target_vol: float = 0.10
     vol_lookback: int = 6
@@ -151,7 +139,6 @@ if torch.cuda.is_available():
 
 
 # Preprocessing pipeline
-
 def load_raw_data(path):
     """Load raw parquet, coerce string-encoded numeric columns, and downcast
     float64 characteristics to float32 to reduce memory consumption"""
@@ -175,7 +162,7 @@ def load_raw_data(path):
 def sort_panel(df):
     """Sort by (id, eom) and remove duplicate (id, eom) observations that can
     arise when annual and quarterly accounting update records overlap for the
-    same security in the same month."""
+    same security in the same month"""
     df = df.sort_values(['id', 'eom']).reset_index(drop=True)
     n_before = len(df)
     df = df.drop_duplicates(subset=['id', 'eom'], keep='first')
@@ -189,7 +176,7 @@ def sort_panel(df):
 def compute_return_targets(df, horizons):
     """Compute compounded cumulative excess return targets at each horizon.
     Log returns are summed and exponentiated to obtain exact compound returns
-    without the small-sample approximation error of simple return summation."""
+    without the small-sample approximation error of simple return summation"""
     df = df.copy()
     max_h = max(horizons)
     log_shifts = {
@@ -207,7 +194,7 @@ def compute_return_targets(df, horizons):
 def classify_characteristics(df, meta_cols, k0_list):
     """Partition all non-metadata columns into K0 (market-based) and K1
     (accounting-based). Target columns computed in the previous step are
-    excluded from both sets."""
+    excluded from both sets"""
     exclude = set(meta_cols) | {c for c in df.columns if c.startswith('target_')}
     all_chars = [c for c in df.columns if c not in exclude]
     k0_cols = [c for c in k0_list if c in set(all_chars)]
@@ -219,7 +206,7 @@ def filter_columns_by_missing(df, train_end, k0_cols, k1_cols, threshold):
     """Drop characteristics whose null rate in the training set exceeds the
     specified threshold. Null rates are computed on training rows only to
     prevent any look-ahead in feature selection. The same retained column list
-    is applied uniformly to all splits."""
+    is applied uniformly to all splits"""
     train_mask = df['eom'] <= pd.Timestamp(train_end)
     null_rates = df.loc[train_mask, k0_cols + k1_cols].isnull().mean()
     retained_k0 = [c for c in k0_cols if null_rates[c] <= threshold]
@@ -232,7 +219,7 @@ def filter_columns_by_missing(df, train_end, k0_cols, k1_cols, threshold):
 def split_data(df, train_end, val_end):
     """Partition the panel into chronologically non-overlapping train, validation,
     and test splits. No firm-level stratification is applied; the split boundary
-    is strict on the end-of-month date."""
+    is strict on the end-of-month date"""
     t1 = pd.Timestamp(train_end)
     t2 = pd.Timestamp(val_end)
     train = df[df['eom'] <= t1].copy()
@@ -249,7 +236,7 @@ def split_data(df, train_end, val_end):
 def drop_high_missing_rows(df, char_cols, threshold=1/3, label=""):
     """Remove firm-months for which more than one third of original
     characteristics are missing. This filter is applied per split after the
-    date split to prevent future information from influencing the threshold."""
+    date split to prevent future information from influencing the threshold"""
     miss_frac = df[char_cols].isnull().mean(axis=1)
     keep = miss_frac <= threshold
     n_drop = (~keep).sum()
@@ -264,7 +251,7 @@ def add_missingness_flags(df, orig_char_cols):
     """Append binary missingness indicator columns (suffix _miss) for each
     original characteristic. Flags are constructed before imputation so that
     the attention mechanism can learn whether absence of a signal carries
-    independent predictive content."""
+    independent predictive content"""
     flags = (
         df[orig_char_cols]
         .isnull()
@@ -278,7 +265,7 @@ def cross_sectional_normalise(df, char_cols, verbose_every=50):
     """Apply cross-sectional median imputation followed by rank normalisation
     to the range [-0.5, 0.5]. Operations run on a single numpy array to avoid
     the block-consolidation memory spike that arises from per-column assignment
-    on a wide pandas DataFrame."""
+    on a wide pandas DataFrame"""
     data = df[char_cols].to_numpy(dtype='float32', na_value=np.nan)
     eoms = df['eom'].to_numpy()
     unique_eoms = np.unique(eoms)
@@ -402,7 +389,8 @@ def run_preprocessing(cfg):
     train = add_missingness_flags(train, orig_char_cols)
     val = add_missingness_flags(val, orig_char_cols)
     test = add_missingness_flags(test, orig_char_cols)
-    print(f"Missingness flags added, {len([c for c in train.columns if c.endswith('_miss')])} columns")
+    train_df = typing.cast(pd.DataFrame, train)
+    print(f"Missingness flags added, {len([c for c in train_df.columns if c.endswith('_miss')])} columns")
 
     print("Normalising training set")
     train = cross_sectional_normalise(train, all_char_cols)
@@ -498,20 +486,6 @@ print(f"Countries, {len(country_codes)}")
 # Dataset
 
 class CrossSectionalDataset(Dataset):
-    """Stores one tensor batch per calendar month. Each batch contains the
-    K0 and K1 characteristic tensors, binary missingness flags, integer
-    country identifiers, continuous return targets, valid-observation masks,
-    a market capitalisation tensor, the firm identifiers from the raw panel,
-    and the end-of-month timestamp for all firms in that month. All firms in
-    the universe are retained; the per-country cross-sectional attention in
-    Path 2 naturally bounds each attention computation to the largest
-    single-country cross section. The market capitalisation tensor is used by
-    the country composite portfolio simulation to weight each country's sub
-    portfolio in proportion to its aggregate market capitalisation. If the
-    'me' column is not present in the processed parquet, every firm is given
-    a weight of one, which reduces the country weighting to a firm count
-    basis, and a warning is printed at load time so this fallback is
-    visible."""
 
     def __init__(self, df, k0_cols, k1_cols, k0_miss_cols, k1_miss_cols,
                  target_col_list, country_lookup, has_market_cap=False):
@@ -568,13 +542,7 @@ class CrossSectionalDataset(Dataset):
 
 
 def load_dataset(path, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, country_lookup):
-    """Read a processed parquet split and construct a CrossSectionalDataset.
-    Columns absent from the parquet schema are zero-filled before tensor
-    construction. The 'me' column, if present in the schema, is loaded as
-    the firm-level market capitalisation used for country weighting in the
-    composite portfolio simulation. If 'me' is absent a visible warning is
-    printed, and the country composite simulation falls back to firm count
-    weighting."""
+
     available = set(pq.read_schema(path).names)
     required = ["id", "eom"] + k0_cols + k1_cols + k0_miss + k1_miss + target_col_list
     has_market_cap = "me" in available
@@ -604,9 +572,6 @@ def load_dataset(path, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, coun
 # Architecture
 
 class GRN(nn.Module):
-    """Gated Residual Network used as the position-wise feed-forward block
-    in the cross-sectional Transformer encoder. The sigmoid gate controls
-    how much of the transformed representation is added to the residual."""
 
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
@@ -659,8 +624,9 @@ class PiecewiseLinearEncoder(nn.Module):
         )
 
     def _encode_bins(self, x):
-        t_lower = self.boundaries[:-1]
-        t_upper = self.boundaries[1:]
+        boundaries = typing.cast(torch.Tensor, self.boundaries)
+        t_lower = boundaries[:-1]
+        t_upper = boundaries[1:]
         x_exp = x.unsqueeze(-1)
         activations = torch.clamp(
             (x_exp - t_lower) / (t_upper - t_lower + 1e-8), 0.0, 1.0
@@ -701,7 +667,6 @@ class FourierEncoder(nn.Module):
 
 
 def build_encoder(variant, n_features, d_model, ple_bins=16, periodic_freq=32):
-    """Factory function returning the encoder module for the specified variant."""
     if variant == "linear":
         return LinearEncoder(n_features, d_model)
     elif variant == "per_feature":
@@ -716,69 +681,48 @@ def build_encoder(variant, n_features, d_model, ple_bins=16, periodic_freq=32):
         raise ValueError(f"Unknown encoding variant: {variant}")
 
 
-class SparseMultiHeadAttention(nn.Module):
-    """Multi-head attention with top-k sparsification. Only the top_k most
-    attended positions per query are retained before the softmax; all others
-    are masked to negative infinity. This reduces the effective receptive
-    field and regularises the peer comparison structure."""
+class MultiHeadAttention(nn.Module):
 
-    def __init__(self, d_model, n_heads, top_k, dropout=0.1):
+    def __init__(self, d_model, n_heads):
         super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        self.d_model = d_model
         self.n_heads = n_heads
-        self.d_k = d_model // n_heads
-        self.top_k = top_k
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.w = nn.ParameterList([
+            nn.Parameter(torch.randn(d_model, d_model) / math.sqrt(d_model))
+            for _ in range(n_heads)
+        ])
+        self.v = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_heads)
+        ])
 
-    def forward(self, x):
-        n_firms = x.shape[0]
-        x_seq = x.unsqueeze(0)
-        q = self.w_q(x_seq).view(1, n_firms, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.w_k(x_seq).view(1, n_firms, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.w_v(x_seq).view(1, n_firms, self.n_heads, self.d_k).transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-        k_eff = min(self.top_k, n_firms)
-        topk_vals, _ = scores.topk(k_eff, dim=-1)
-        threshold = topk_vals[..., -1:].detach()
-        scores = scores.masked_fill(scores < threshold, float("-inf"))
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        context = torch.matmul(attn_weights, v)
-        context = context.transpose(1, 2).contiguous().view(1, n_firms, self.d_model)
-        out = self.w_o(context).squeeze(0)
-        return out, attn_weights.squeeze(0)
+    def forward(self, y):
+        head_outputs = []
+        head_weights = []
+        for h in range(self.n_heads):
+            scores = y @ self.w[h] @ y.t()
+            weights = F.softmax(scores, dim=-1)
+            head_outputs.append(weights @ self.v[h](y))
+            head_weights.append(weights)
+        out = torch.stack(head_outputs, dim=0).sum(dim=0)
+        return out, torch.stack(head_weights, dim=0)
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LayerNorm Transformer encoder block consisting of sparse multi-head
-    self-attention followed by a Gated Residual Network. Pre-normalisation
-    improves gradient flow in deep stacks."""
 
-    def __init__(self, d_model, n_heads, d_ff, top_k, dropout=0.1):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attention = SparseMultiHeadAttention(d_model, n_heads, top_k, dropout)
-        self.grn = GRN(d_model, d_ff, dropout)
+        self.attention = MultiHeadAttention(d_model, n_heads)
+        self.w1 = nn.Linear(d_model, d_ff)
+        self.w2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x):
-        normed = self.norm1(x)
-        attn_out, attn_weights = self.attention(normed)
-        x = x + attn_out
-        x = self.grn(x)
-        return x, attn_weights
+        attn_out, attn_weights = self.attention(x)
+        a_r = attn_out + x
+        f = self.w2(F.relu(self.w1(a_r)))
+        f_r = f + a_r
+        return f_r, attn_weights
 
 
 class AttentiveAggregation(nn.Module):
-    """Attention-weighted pooling for K0 and K1 characteristics with soft
-    missingness masking. A learned scalar penalty gamma is subtracted from
-    the pre-softmax logit of each missing feature, driving its aggregation
-    weight toward zero while allowing the model to learn the optimal degree
-    of down-weighting."""
 
     def __init__(self, d_model):
         super().__init__()
@@ -797,14 +741,10 @@ class AttentiveAggregation(nn.Module):
 
 
 class FirmScoreHead(nn.Module):
-    """Variable-depth MLP scoring head for per-firm base score prediction.
-    The architecture is LayerNorm -> [Linear, ELU, Dropout] x L -> Linear -> scalar.
-    Three separate instances are instantiated for the 3m, 6m, and 12m horizons,
-    sharing no parameters."""
 
     def __init__(self, d_model, d_ff, n_layers, dropout):
         super().__init__()
-        modules = [nn.LayerNorm(d_model)]
+        modules: list[nn.Module] = [nn.LayerNorm(d_model)]
         for i in range(n_layers):
             in_dim = d_model if i == 0 else d_ff
             modules.extend([nn.Linear(in_dim, d_ff), nn.ELU(), nn.Dropout(dropout)])
@@ -816,14 +756,18 @@ class FirmScoreHead(nn.Module):
         return self.net(z).squeeze(-1)
 
 
+def _cross_sectional_soft_norm(z_c, temperature=2.0):
+
+    n = z_c.shape[0]
+    if n <= 1:
+        return torch.zeros_like(z_c)
+    mean = z_c.mean(dim=0, keepdim=True)
+    std = z_c.std(dim=0, keepdim=True, unbiased=False)
+    z_score = (z_c - mean) / (std + 1e-6)
+    return 0.5 * torch.tanh(z_score / temperature)
+
+
 class DualPathTransformer(nn.Module):
-    """Dual Path Portfolio Transformer. Path 1 processes all firms independently
-    through attentive feature aggregation and a multi-layer scoring head to
-    produce base scores. Path 2 groups firms by country and applies shared
-    sparse Transformer encoder blocks to produce peer-relative adjustment scores.
-    The final predicted score is the elementwise sum of both paths. The per-country
-    grouping eliminates the global max_firms truncation: every firm in the universe
-    participates in cross-sectional attention within its own country group."""
 
     def __init__(self, config):
         super().__init__()
@@ -848,42 +792,26 @@ class DualPathTransformer(nn.Module):
         self.k0_agg = AttentiveAggregation(config.d_model)
         self.k1_agg = AttentiveAggregation(config.d_model)
 
-        # Path 1: independent per-firm scoring heads
-        self.base_head_3m = FirmScoreHead(
-            config.d_model, config.d_ff, config.n_mlp_layers, config.dropout
-        )
+        # Path 1: independent per-firm scoring head, six month horizon only
         self.base_head_6m = FirmScoreHead(
             config.d_model, config.d_ff, config.n_mlp_layers, config.dropout
         )
-        self.base_head_12m = FirmScoreHead(
-            config.d_model, config.d_ff, config.n_mlp_layers, config.dropout
-        )
 
-        # Path 2: shared cross-sectional Transformer blocks applied per country
         self.blocks = nn.ModuleList([
             TransformerBlock(
-                config.d_model, config.n_heads, config.d_ff,
-                config.top_k_attention, config.dropout,
+                config.d_model, config.n_heads, config.d_ff, config.dropout,
             )
             for _ in range(config.n_layers)
         ])
 
-        # Path 2: lightweight adjustment heads (LayerNorm + single linear layer)
-        self.adj_head_3m = nn.Sequential(
-            nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1)
-        )
+        # Path 2: lightweight adjustment head (LayerNorm + single linear layer)
         self.adj_head_6m = nn.Sequential(
-            nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1)
-        )
-        self.adj_head_12m = nn.Sequential(
             nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1)
         )
 
         self.min_firms = config.min_firms_attention
 
     def _encode_firms(self, k0, k1, k0_miss, k1_miss):
-        """Shared encoding stage: produces firm embeddings z_i for all firms
-        in the cross-section without any cross-firm interaction."""
 
         # K0: encode, add static characteristic embedding, aggregate
         k0_encoded = self.k0_encoder(k0) + self.k0_static_emb.unsqueeze(0)
@@ -894,86 +822,84 @@ class DualPathTransformer(nn.Module):
         k1_token, k1_weights = self.k1_agg(k1_encoded, k1_miss)
 
         z = k0_token + k1_token
-        agg_info = {
-            "k0_weights": k0_weights,
-            "k1_weights": k1_weights,
-        }
+        agg_info = { "k0_weights": k0_weights, "k1_weights": k1_weights}
         return z, agg_info
 
     def forward(self, k0, k1, k0_miss, k1_miss, country_ids):
         z, agg_info = self._encode_firms(k0, k1, k0_miss, k1_miss)
 
         # Path 1: base scores for all firms
-        base_3m = self.base_head_3m(z)
         base_6m = self.base_head_6m(z)
-        base_12m = self.base_head_12m(z)
 
         # Path 2: per-country adjustment scores
-        adj_3m = torch.zeros_like(base_3m)
         adj_6m = torch.zeros_like(base_6m)
-        adj_12m = torch.zeros_like(base_12m)
         all_attn = []
 
         for cid in country_ids.unique():
             mask = country_ids == cid
             if mask.sum() < self.min_firms:
                 # Countries below the minimum size receive no cross-sectional
-                # adjustment; their final score is the Path 1 base score alone,
+                # adjustment. Their final score is the Path 1 base score alone,
                 # which is trained to be independently predictive via the aux loss
                 continue
             z_c = z[mask]
+            z_c = _cross_sectional_soft_norm(z_c)
             for block in self.blocks:
                 z_c, attn_w = block(z_c)
                 all_attn.append(attn_w)
-            adj_3m[mask] = self.adj_head_3m(z_c).squeeze(-1)
             adj_6m[mask] = self.adj_head_6m(z_c).squeeze(-1)
-            adj_12m[mask] = self.adj_head_12m(z_c).squeeze(-1)
 
         return {
-            "scores_3m": base_3m + adj_3m,
-            "scores_6m": base_6m + adj_6m,
-            "scores_12m": base_12m + adj_12m,
-            "base_3m": base_3m,
-            "base_6m": base_6m,
-            "base_12m": base_12m,
-            "attn": all_attn,
-            "agg": agg_info,
+            "scores_6m": base_6m + adj_6m, "base_6m": base_6m,
+            "adj_6m": adj_6m, "attn": all_attn, "agg": agg_info
         }
 
 
 # Training components
 
-def compute_dual_path_loss(output, targets, valid_masks, config):
-    """Combined Huber loss on final combined scores plus an auxiliary Huber
-    loss on the per-firm base scores. The auxiliary term ensures that Path 1
-    remains independently predictive and prevents Path 2 from compensating
-    for an undertrained per-firm encoder."""
-    main_loss = torch.tensor(0.0, device=output["scores_3m"].device)
-    aux_loss = torch.tensor(0.0, device=output["scores_3m"].device)
-    for horizon, weight in [
-        ("3m", config.lambda_3m),
-        ("6m", config.lambda_6m),
-        ("12m", config.lambda_12m),
-    ]:
-        target_key = f"target_{horizon}"
-        valid = valid_masks[target_key]
-        if valid.sum() == 0:
-            continue
-        t = targets[target_key][valid]
-        main_loss = main_loss + weight * F.huber_loss(
-            output[f"scores_{horizon}"][valid], t, delta=1.0
-        )
-        aux_loss = aux_loss + weight * F.huber_loss(
-            output[f"base_{horizon}"][valid], t, delta=1.0
-        )
+def _differentiable_long_short_return(scores, returns, valid_mask):
+
+    valid_scores = scores[valid_mask]
+    valid_returns = returns[valid_mask]
+    n_valid = valid_scores.shape[0]
+    if n_valid < 10:
+        return torch.tensor(0.0, device=scores.device, requires_grad=True)
+    mean_score = valid_scores.mean()
+    long_mask = valid_scores > mean_score
+    short_mask = ~long_mask
+    if long_mask.sum() == 0 or short_mask.sum() == 0:
+        return torch.tensor(0.0, device=scores.device, requires_grad=True)
+    long_logits = valid_scores[long_mask] - mean_score
+    short_logits = mean_score - valid_scores[short_mask]
+    long_w = F.softmax(long_logits, dim=0)
+    short_w = F.softmax(short_logits, dim=0)
+    long_ret = (long_w * valid_returns[long_mask]).sum()
+    short_ret = (short_w * valid_returns[short_mask]).sum()
+    return long_ret - short_ret
+
+
+def compute_msrr_loss(output, targets, valid_masks, config):
+   
+    device_ = output["scores_6m"].device
+    target = targets["target_6m"]
+    valid = valid_masks["target_6m"]
+    if valid.sum() < 10:
+        zero = torch.tensor(0.0, device=device_, requires_grad=True)
+        return zero, 0.0, 0.0
+    r_pf = _differentiable_long_short_return(
+        output["scores_6m"], target, valid
+    )
+    r_base = _differentiable_long_short_return(
+        output["base_6m"], target, valid
+    )
+    main_loss = (1.0 - r_pf).pow(2)
+    aux_loss = (1.0 - r_base).pow(2)
     total = main_loss + config.lambda_aux * aux_loss
     return total, main_loss.item(), aux_loss.item()
 
 
 def compute_rank_correlation(scores, targets, valid_mask):
-    """Spearman rank correlation between predicted scores and realised returns,
-    computed in-graph to allow use as a monitoring metric during training. A
-    minimum of 10 valid observations is required to return a non-zero value."""
+   
     valid = valid_mask
     if valid.sum() < 10:
         return 0.0
@@ -1000,11 +926,7 @@ def compute_rank_correlation(scores, targets, valid_mask):
 
 
 def train_one_epoch(model, dataset, optimizer, config, scaler):
-    """Run one full pass over the training dataset in random month order.
-    Mixed precision training is applied via GradScaler. Gradient clipping
-    at config.grad_clip guards against exploding gradients from extreme returns.
-    Returns a four-tuple of epoch-averaged (total_loss, main_loss, aux_loss,
-    grad_norm)."""
+    
     model.train()
     epoch_loss = 0.0
     epoch_main = 0.0
@@ -1025,13 +947,16 @@ def train_one_epoch(model, dataset, optimizer, config, scaler):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device.type):
             output = model(k0, k1, k0_miss, k1_miss, cids)
-            loss, main_val, aux_val = compute_dual_path_loss(
+            loss, main_val, aux_val = compute_msrr_loss(
                 output, targets, valid_masks, config
             )
 
         if loss.requires_grad:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), config.grad_clip
             )
@@ -1050,14 +975,12 @@ def train_one_epoch(model, dataset, optimizer, config, scaler):
 
 @torch.no_grad()
 def evaluate(model, dataset, config):
-    """Evaluate the model on a dataset, returning the average Huber loss and
-    per-horizon Spearman rank correlations. Early stopping and learning rate
-    scheduling are driven by the 6-month rank correlation, not the loss,
-    to avoid the proxy mismatch where loss improvement concentrates in the
-    middle of the return distribution rather than the tails."""
+   
     model.eval()
     total_loss = 0.0
-    total_corr = {"target_3m": 0.0, "target_6m": 0.0, "target_12m": 0.0}
+    total_corr_6m = 0.0
+    total_corr_base_6m = 0.0
+    total_corr_adj_6m = 0.0
     n_months = 0
     for idx in range(len(dataset)):
         batch = dataset[idx]
@@ -1070,26 +993,29 @@ def evaluate(model, dataset, config):
         valid_masks = {k: v.to(device) for k, v in batch["valid_masks"].items()}
 
         output = model(k0, k1, k0_miss, k1_miss, cids)
-        loss, _, _ = compute_dual_path_loss(output, targets, valid_masks, config)
+        loss, _, _ = compute_msrr_loss(output, targets, valid_masks, config)
         total_loss += loss.item()
 
-        for horizon in ["target_3m", "target_6m", "target_12m"]:
-            score_key = horizon.replace("target_", "scores_")
-            total_corr[horizon] += compute_rank_correlation(
-                output[score_key], targets[horizon], valid_masks[horizon]
-            )
+        total_corr_6m += compute_rank_correlation(
+            output["scores_6m"], targets["target_6m"], valid_masks["target_6m"]
+        )
+        total_corr_base_6m += compute_rank_correlation(
+            output["base_6m"], targets["target_6m"], valid_masks["target_6m"]
+        )
+        total_corr_adj_6m += compute_rank_correlation(
+            output["adj_6m"], targets["target_6m"], valid_masks["target_6m"]
+        )
         n_months += 1
 
     n = max(n_months, 1)
     return {
-        "loss": total_loss / n,
-        "rank_corr": {k: v / n for k, v in total_corr.items()},
+        "loss": total_loss / n, "rank_corr_6m": total_corr_6m / n,
+        "rank_corr_base_6m": total_corr_base_6m / n, "rank_corr_adj_6m": total_corr_adj_6m / n,
     }
 
 
 def _model_parameter_breakdown(model):
-    """Compute trainable parameter counts grouped by top-level submodule
-    name. Returns an ordered dict suitable for serialisation."""
+
     counts = {}
     seen_params = set()
     for name, module in model.named_children():
@@ -1113,16 +1039,7 @@ def _model_parameter_breakdown(model):
 
 
 def _capture_tensor_shapes(model, config):
-    """Run a single forward pass with a small dummy batch and record the
-    shape of every intermediate tensor as it flows through the K0 and K1
-    encoders, static embeddings, aggregation, scoring heads, cross
-    sectional attention blocks, and adjustment heads. Returns a list of
-    {stage, input_shape, output_shape, description} dictionaries.
-
-    The trace is built by attaching forward hooks to the named submodules.
-    The dummy batch uses two firms, both in the same dummy country with id
-    zero, which is enough to exercise the per-country attention path when
-    min_firms is reduced to one for the trace only."""
+    
     n_k0 = len(k0_chars)
     n_k1 = len(k1_chars)
     dummy_k0 = torch.zeros(2, n_k0, device=device)
@@ -1157,12 +1074,8 @@ def _capture_tensor_shapes(model, config):
         "k1_encoder": "K1 characteristic encoding to R^d",
         "k0_agg": "K0 attention-weighted aggregation to firm token",
         "k1_agg": "K1 attention-weighted aggregation to firm token",
-        "base_head_3m": "Per firm base score head, 3 month horizon",
         "base_head_6m": "Per firm base score head, 6 month horizon",
-        "base_head_12m": "Per firm base score head, 12 month horizon",
-        "adj_head_3m": "Cross sectional adjustment head, 3 month horizon",
         "adj_head_6m": "Cross sectional adjustment head, 6 month horizon",
-        "adj_head_12m": "Cross sectional adjustment head, 12 month horizon",
     }
     for name, module in model.named_children():
         desc = submodule_descriptions.get(name, "")
@@ -1191,8 +1104,7 @@ def _capture_tensor_shapes(model, config):
 
 
 def _config_to_dict(config):
-    """Convert a Config dataclass instance to a JSON serialisable
-    dictionary, casting Path fields to strings."""
+    
     d = asdict(config)
     for k, v in d.items():
         if isinstance(v, Path):
@@ -1200,12 +1112,10 @@ def _config_to_dict(config):
     return d
 
 
-def train_variant(config):
-    """Train the Dual Path Transformer for a single encoding variant. The
-    function records wall clock training time, saves model weights as a
-    safetensors file, and stores validation metrics at the best epoch
-    alongside the per epoch history in the resulting metrics JSON file."""
+def train_variant(config, seed_idx=0):
+    
     variant = config.encoding_variant
+    seed_tag = f"seed{seed_idx}"
     w = 104
     bar = "=" * w
     sep = "-" * w
@@ -1215,17 +1125,15 @@ def train_variant(config):
             print(line)
 
     _block([
-        bar,
-        f"Variant {variant}",
-        f"Architecture d_model={config.d_model}  n_heads={config.n_heads}"
+        bar, f"Variant {variant}  Seed {seed_idx}",
+        f"Architecture d_model={config.d_model}  n_heads={config.n_heads}  "
         f"n_layers={config.n_layers}  d_ff={config.d_ff}  dropout={config.dropout}",
-        f"n_mlp_layers={config.n_mlp_layers}"
+        f"n_mlp_layers={config.n_mlp_layers}  "
         f"lambda_aux={config.lambda_aux}  top_k_attention={config.top_k_attention}  "
         f"min_firms_attention={config.min_firms_attention}",
-        f"Loss weights 3m={config.lambda_3m}  6m={config.lambda_6m}  "
-        f"12m={config.lambda_12m}  aux={config.lambda_aux}",
         f"Optimiser lr={config.learning_rate:.2e}  wd={config.weight_decay:.2e}  "
         f"grad_clip={config.grad_clip}  patience={config.patience}",
+        f"Loss MSRR (1 - r_pf)^2 + lambda_aux (1 - r_base)^2  lambda_aux={config.lambda_aux}",
     ])
 
     train_ds = load_dataset(config.train_path, k0_feature_cols, k1_feature_cols,
@@ -1241,13 +1149,11 @@ def train_variant(config):
     tensor_shapes = _capture_tensor_shapes(model, config)
 
     _block([
-        f" Data train_months={len(train_ds)}  val_months={len(val_ds)}",
-        f" Model {n_params:,} trainable parameters", bar,
+        f" Data train_months={len(train_ds)}  val_months={len(val_ds)} Model {n_params:,} trainable parameters", bar,
     ])
 
     col_header = (
-        f"{'Epoch':>5}{'TrnTotal':>9}{'TrnMain':>9}{'TrnAux':>9}  "
-        f"{'ValLoss':>9}{'Corr3m':>7}{'Corr6m':>7}{'Corr12m':>8}  "
+        f"{'Epoch':>5}{'TrnTotal':>9}{'TrnMain':>9}{'TrnAux':>9}{'ValLoss':>9}{'Corr6m':>8}{'Base6m':>8}{'Adj6m':>8}"
         f"{'LR':>9}{'GNorm':>8}"
     )
     print(col_header)
@@ -1259,61 +1165,79 @@ def train_variant(config):
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+    # Model selection now drives on validation MSRR loss (minimise), hence
+    # ReduceLROnPlateau runs in min mode rather than max mode as before.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=10,
+        optimizer, mode="min", factor=0.5, patience=10,
     )
 
-    best_val_corr = -float("inf")
+    best_val_loss = float("inf")
     best_epoch = 1
     best_val_metrics = None
     patience_counter = 0
     history = {
         "train_loss": [], "train_main": [], "train_aux": [],
         "val_loss": [], "val_corr_6m": [],
+        "val_base_corr_6m": [], "val_adj_corr_6m": [],
     }
-    weights_path = config.results_dir / f"weights_{variant}.safetensors"
+    weights_path = config.results_dir / f"weights_{variant}_{seed_tag}.safetensors"
     scaler = torch.GradScaler(device.type)
 
     training_start_time = time.time()
 
     for epoch in range(1, config.max_epochs + 1):
-        train_loss, train_main, train_aux, grad_norm = train_one_epoch(
-            model, train_ds, optimizer, config, scaler,
-        )
-        val_metrics = evaluate(model, val_ds, config)
-        val_corr_6m = val_metrics["rank_corr"]["target_6m"]
-
-        # linear warmup: set lr directly for the first warmup_epochs epochs
-        # so the model explores the loss surface before ReduceLROnPlateau
-        # starts contracting the learning rate on stagnating validation signal.
+        # Linear warmup: set the learning rate for this epoch before training.
+        # Previously this block ran after train_one_epoch, so epoch 1 trained
+        # at the full learning rate (the AdamW init value), which caused
+        # overflow gradients on fresh random weights. The GradScaler then
+        # silently skipped the first parameter update, leaving the model at
+        # random initialisation, whose val loss became the permanent best.
         if epoch <= config.warmup_epochs:
             warmup_lr = config.learning_rate * epoch / config.warmup_epochs
             for pg in optimizer.param_groups:
                 pg["lr"] = warmup_lr
-        else:
-            scheduler.step(val_corr_6m)
+
+        train_loss, train_main, train_aux, grad_norm = train_one_epoch(
+            model, train_ds, optimizer, config, scaler,
+        )
+        val_metrics = evaluate(model, val_ds, config)
+        val_loss = val_metrics["loss"]
+        val_corr_6m = val_metrics["rank_corr_6m"]
+        val_base_corr_6m = val_metrics["rank_corr_base_6m"]
+        val_adj_corr_6m = val_metrics["rank_corr_adj_6m"]
+
+        # ReduceLROnPlateau only after warmup is complete
+        if epoch > config.warmup_epochs:
+            scheduler.step(val_loss)
 
         history["train_loss"].append(train_loss)
         history["train_main"].append(train_main)
         history["train_aux"].append(train_aux)
-        history["val_loss"].append(val_metrics["loss"])
+        history["val_loss"].append(val_loss)
         history["val_corr_6m"].append(val_corr_6m)
+        history["val_base_corr_6m"].append(val_base_corr_6m)
+        history["val_adj_corr_6m"].append(val_adj_corr_6m)
 
         current_lr = optimizer.param_groups[0]["lr"]
-        is_best = val_corr_6m > best_val_corr + 1e-5
+        # epoch > config.warmup_epochs excludes the ramp-up window from ever
+        # being saved as the checkpoint. Previously is_best had no such guard,
+        # so a deceptively low val_loss during warmup could overwrite
+        # weights_path, and the saved weights would still be the warmup-era
+        # ones even though best_epoch was later clamped for reporting only,
+        # since there is no retrain step left to re-run for more epochs.
+        is_best = epoch > config.warmup_epochs and val_loss < best_val_loss - 1e-5
         marker = "  *" if is_best else ""
 
         row = (
-            f"{epoch:>5}{train_loss:>9.6f}{train_main:>9.6f}{train_aux:>9.6f}  "
-            f"{val_metrics['loss']:>9.6f}{val_metrics['rank_corr']['target_3m']:>7.4f}  "
-            f"{val_corr_6m:>7.4f}{val_metrics['rank_corr']['target_12m']:>8.4f}  "
+            f"{epoch:>5}{train_loss:>9.6f}{train_main:>9.6f}{train_aux:>9.6f}"
+            f"{val_loss:>9.6f}{val_corr_6m:>8.4f}{val_base_corr_6m:>8.4f}{val_adj_corr_6m:>8.4f}"
             f"{current_lr:>9.2e}{grad_norm:>8.4f}{marker}"
         )
         print(row)
         sys.stdout.flush()
 
         if is_best:
-            best_val_corr = val_corr_6m
+            best_val_loss = val_loss
             best_epoch = epoch
             best_val_metrics = val_metrics
             patience_counter = 0
@@ -1323,9 +1247,8 @@ def train_variant(config):
             if patience_counter >= config.patience:
                 print(sep)
                 print(
-                    f"Early stopping at epoch {epoch}  "
-                    f"(patience={config.patience}  best_epoch={best_epoch}  "
-                    f"best_corr6m={best_val_corr:.4f})"
+                    f"Early stopping at epoch {epoch}(patience={config.patience}  best_epoch={best_epoch}"
+                    f"best_val_loss={best_val_loss:.6f})"
                 )
                 break
 
@@ -1343,17 +1266,16 @@ def train_variant(config):
     test_metrics = evaluate(model, test_ds, config)
     del test_ds
 
-    corr = test_metrics["rank_corr"]
     _block([
         bar,
-        f" Test Results  ({variant})", sep,
-        f"{'Test loss':<22} {test_metrics['loss']:>10.6f}",
-        f"{'Rank corr  3m':<22}{corr['target_3m']:>10.4f}",
-        f"{'Rank corr  6m':<22}{corr['target_6m']:>10.4f}",
-        f"{'Rank corr 12m':<22}{corr['target_12m']:>10.4f}",sep,
-        f"Best val corr 6m {best_val_corr:.4f}  (epoch {best_epoch})",
+        f"Test Results  ({variant}, {seed_tag})", sep,
+        f"{'Test MSRR loss':<22} {test_metrics['loss']:>10.6f}",
+        f"{'Test rank corr 6m':<22}{test_metrics['rank_corr_6m']:>10.4f}",
+        f"{'Test base corr 6m':<22}{test_metrics['rank_corr_base_6m']:>10.4f}",
+        f"{'Test adj corr 6m':<22}{test_metrics['rank_corr_adj_6m']:>10.4f}", sep,
+        f"Best val loss {best_val_loss:.6f}  (epoch {best_epoch})",
         f"Stopped epoch {final_epoch}",
-        f"Training time {training_time_seconds:.1f} seconds",sep,
+        f"Training time {training_time_seconds:.1f} seconds", sep,
         f"Weights {weights_path}",
     ])
 
@@ -1374,13 +1296,15 @@ def train_variant(config):
         "tensor_shapes": tensor_shapes,
     }
 
-    results_path = config.results_dir / f"metrics_{variant}.json"
+    results_path = config.results_dir / f"metrics_{variant}_{seed_tag}.json"
     with open(results_path, "w") as f:
         json.dump(
             {
                 "variant": variant,
+                "seed_idx": seed_idx,
+                "seed_value": config.seed,
                 "n_params": n_params,
-                "best_val_corr": best_val_corr,
+                "best_val_loss": best_val_loss,
                 "best_epoch": best_epoch,
                 "stopped_epoch": final_epoch,
                 "training_time_seconds": training_time_seconds,
@@ -1398,20 +1322,23 @@ def train_variant(config):
             f, indent=2,
         )
 
-    _block([f"Metrics{results_path}", bar, ""])
+    _block([f"Metrics {results_path}", bar, ""])
 
     del model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# train all five encoding variants in sequence, applying the tuned
-# hyperparameters from results/transformer-hpt/best_params_{variant}.json
-# when available. the json file for each variant is written by the optuna
-# study in hpt_dual_path.py and contains the configuration that achieved
-# the highest validation long short sharpe ratio for that variant.
+
+# Train all five encoding variants across n_seeds independent random
+# initialisations. For each (variant, seed) pair the tuned hyperparameters
+# from results/transformer-hpt/best_params_{variant}.json are applied when
+# available. The evaluation script averages model scores across the five
+# seeds at portfolio formation time, hence each seeded checkpoint must be
+# saved under a seed-suffixed filename.
 
 hpt_dir = cfg.results_dir / "transformer-hpt"
+base_seed = cfg.seed
 
 for variant_name in ["linear", "per_feature", "ple", "periodic", "fourier"]:
     cfg.encoding_variant = variant_name
@@ -1425,15 +1352,14 @@ for variant_name in ["linear", "per_feature", "ple", "periodic", "fourier"]:
         cfg.n_layers = best_params["n_layers"]
         cfg.d_ff = best_params["d_ff_derived"]
         cfg.dropout = best_params["dropout"]
-        cfg.top_k_attention = best_params["top_k_attention"]
+
+        if "top_k_attention" in best_params:
+            cfg.top_k_attention = best_params["top_k_attention"]
         cfg.n_mlp_layers = best_params["n_mlp_layers"]
         cfg.lambda_aux = best_params["lambda_aux"]
         cfg.learning_rate = best_params["lr"]
         cfg.weight_decay = best_params["weight_decay"]
         cfg.grad_clip = best_params["grad_clip"]
-        cfg.lambda_3m = best_params["lambda_3m"]
-        cfg.lambda_12m = best_params["lambda_12m"]
-        cfg.lambda_6m = 1.0 - cfg.lambda_3m - cfg.lambda_12m
         if "periodic_num_freq" in best_params:
             cfg.periodic_num_freq = best_params["periodic_num_freq"]
         if "ple_num_bins" in best_params:
@@ -1446,6 +1372,12 @@ for variant_name in ["linear", "per_feature", "ple", "periodic", "fourier"]:
     else:
         print(f"no tuned hyperparameters found at {hpt_path}, using defaults")
 
-    train_variant(cfg)
+    for seed_idx in range(cfg.n_seeds):
+        cfg.seed = base_seed + seed_idx
+        torch.manual_seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.seed)
+        train_variant(cfg, seed_idx=seed_idx)
 
-print("All variants trained successfully")
+print("All variants and seeds trained successfully")

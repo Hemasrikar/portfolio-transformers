@@ -4,6 +4,8 @@ import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+import re
+import typing
 
 import numpy as np
 import pandas as pd
@@ -18,7 +20,7 @@ warnings.filterwarnings("ignore")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-target_cols = ["target_1m", "target_3m", "target_6m", "target_12m"]
+target_cols = ["target_1m", "target_6m"]
 
 
 @dataclass
@@ -39,33 +41,17 @@ class Config:
     top_k_attention: int = 50
     ple_num_bins: int = 16
     periodic_num_freq: int = 32
-
-    # Dual path specific parameters
     n_mlp_layers: int = 2
     lambda_aux: float = 0.3
     min_firms_attention: int = 10
-
-    # Portfolio risk management
     target_vol: float = 0.10
-    # vol_lookback_months is the trailing window used to estimate realised
-    # volatility for the leverage overlay, expressed in calendar months.
-    # using months rather than rebalance periods keeps the window stable
-    # across different rebalance frequencies: 36 months gives 6 semi-annual
-    # observations (freq=6) or 12 quarterly observations (freq=3). increase
-    # to 48 or 60 for a more stable but slower-reacting vol estimate.
     vol_lookback_months: int = 36
     max_leverage_long_only: float = 3.0
     max_leverage_long_short: float = 3.0
     min_firms_country: int = 20
     max_position_weight: float = 0.05
-    # Portfolio construction
-    # rebalance_freq controls the primary (6m horizon) rebalance cadence.
-    # the 3m and 12m horizons use 3 and 12 respectively, derived from the
-    # horizon label in the evaluation loop, so this field drives the
-    # validation-set simulation used for variant selection only.
     rebalance_freq: int = 3
     tc_bps: int = 25
-
     encoding_variant: str = "linear"
     seed: int = 24
 
@@ -263,8 +249,9 @@ class PiecewiseLinearEncoder(nn.Module):
         )
 
     def _encode_bins(self, x):
-        t_lower = self.boundaries[:-1]
-        t_upper = self.boundaries[1:]
+        boundaries = typing.cast(torch.Tensor, self.boundaries)
+        t_lower = boundaries[:-1]
+        t_upper = boundaries[1:]
         x_exp = x.unsqueeze(-1)
         activations = torch.clamp(
             (x_exp - t_lower) / (t_upper - t_lower + 1e-8), 0.0, 1.0
@@ -319,52 +306,56 @@ def build_encoder(variant, n_features, d_model, ple_bins=16, periodic_freq=32):
         raise ValueError(f"Unknown encoding variant: {variant}")
 
 
-class SparseMultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, top_k, dropout=0.1):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_k = d_model // n_heads
-        self.top_k = top_k
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
+class MultiHeadAttention(nn.Module):
+    """Kelly, Kuznetsov, Malamud, and Xu (2025), equation 13. Bilinear
+    per-head attention sigma(Y W_h Y') Y V_h, summed across heads, dense
+    softmax with no top-k truncation. No dropout, matching the paper.
+    No 1/sqrt(d_model) scaling; a diagnostic on a real trained checkpoint
+    showed combining scaling with cross-sectional rank normalisation of the
+    input (see _cross_sectional_soft_norm) undid most of the normalisation's
+    benefit. The normalisation is what fixes the attention collapse; see
+    nonlinear_dualapproach.py for the full rationale."""
 
-    def forward(self, x):
-        n_firms = x.shape[0]
-        x_seq = x.unsqueeze(0)
-        q = self.w_q(x_seq).view(1, n_firms, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.w_k(x_seq).view(1, n_firms, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.w_v(x_seq).view(1, n_firms, self.n_heads, self.d_k).transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-        k_eff = min(self.top_k, n_firms)
-        topk_vals, _ = scores.topk(k_eff, dim=-1)
-        threshold = topk_vals[..., -1:].detach()
-        scores = scores.masked_fill(scores < threshold, float("-inf"))
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        context = torch.matmul(attn_weights, v)
-        context = context.transpose(1, 2).contiguous().view(1, n_firms, self.d_model)
-        out = self.w_o(context).squeeze(0)
-        return out, attn_weights.squeeze(0)
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+        self.w = nn.ParameterList([
+            nn.Parameter(torch.randn(d_model, d_model) / math.sqrt(d_model))
+            for _ in range(n_heads)
+        ])
+        self.v = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_heads)
+        ])
+
+    def forward(self, y):
+        head_outputs = []
+        head_weights = []
+        for h in range(self.n_heads):
+            scores = y @ self.w[h] @ y.t()
+            weights = F.softmax(scores, dim=-1)
+            head_outputs.append(weights @ self.v[h](y))
+            head_weights.append(weights)
+        out = torch.stack(head_outputs, dim=0).sum(dim=0)
+        return out, torch.stack(head_weights, dim=0)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, top_k, dropout=0.1):
+    """Kelly, Kuznetsov, Malamud, and Xu (2025), equations 13-17. Bare
+    residual connections with no LayerNorm, single hidden layer ReLU
+    feed-forward: T(Y) = F^R(A^R(Y)). No dropout, matching the paper."""
+
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attention = SparseMultiHeadAttention(d_model, n_heads, top_k, dropout)
-        self.grn = GRN(d_model, d_ff, dropout)
+        self.attention = MultiHeadAttention(d_model, n_heads)
+        self.w1 = nn.Linear(d_model, d_ff)
+        self.w2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x):
-        normed = self.norm1(x)
-        attn_out, attn_weights = self.attention(normed)
-        x = x + attn_out
-        x = self.grn(x)
-        return x, attn_weights
+        attn_out, attn_w = self.attention(x)
+        a_r = attn_out + x
+        f = self.w2(F.relu(self.w1(a_r)))
+        f_r = f + a_r
+        return f_r, attn_w
 
 
 class AttentiveAggregation(nn.Module):
@@ -387,7 +378,7 @@ class AttentiveAggregation(nn.Module):
 class FirmScoreHead(nn.Module):
     def __init__(self, d_model, d_ff, n_layers, dropout):
         super().__init__()
-        modules = [nn.LayerNorm(d_model)]
+        modules: list[nn.Module] = [nn.LayerNorm(d_model)]
         for i in range(n_layers):
             in_dim = d_model if i == 0 else d_ff
             modules.extend([nn.Linear(in_dim, d_ff), nn.ELU(), nn.Dropout(dropout)])
@@ -397,6 +388,16 @@ class FirmScoreHead(nn.Module):
 
     def forward(self, z):
         return self.net(z).squeeze(-1)
+
+
+def _cross_sectional_soft_norm(z_c, temperature=2.0):
+    n = z_c.shape[0]
+    if n <= 1:
+        return torch.zeros_like(z_c)
+    mean = z_c.mean(dim=0, keepdim=True)
+    std = z_c.std(dim=0, keepdim=True, unbiased=False)
+    z_score = (z_c - mean) / (std + 1e-6)
+    return 0.5 * torch.tanh(z_score / temperature)
 
 
 class DualPathTransformer(nn.Module):
@@ -421,31 +422,21 @@ class DualPathTransformer(nn.Module):
         self.k0_agg = AttentiveAggregation(config.d_model)
         self.k1_agg = AttentiveAggregation(config.d_model)
 
-        self.base_head_3m = FirmScoreHead(
-            config.d_model, config.d_ff, config.n_mlp_layers, config.dropout
-        )
         self.base_head_6m = FirmScoreHead(
             config.d_model, config.d_ff, config.n_mlp_layers, config.dropout
         )
-        self.base_head_12m = FirmScoreHead(
-            config.d_model, config.d_ff, config.n_mlp_layers, config.dropout
-        )
+
+        # z is cross-sectionally rank-normalised within each country group
+        # before Path 2 attention, using _cross_sectional_soft_norm
 
         self.blocks = nn.ModuleList([
             TransformerBlock(
-                config.d_model, config.n_heads, config.d_ff,
-                config.top_k_attention, config.dropout,
+                config.d_model, config.n_heads, config.d_ff, config.dropout,
             )
             for _ in range(config.n_layers)
         ])
 
-        self.adj_head_3m = nn.Sequential(
-            nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1)
-        )
         self.adj_head_6m = nn.Sequential(
-            nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1)
-        )
-        self.adj_head_12m = nn.Sequential(
             nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1)
         )
 
@@ -463,13 +454,9 @@ class DualPathTransformer(nn.Module):
     def forward(self, k0, k1, k0_miss, k1_miss, country_ids):
         z, agg_info = self._encode_firms(k0, k1, k0_miss, k1_miss)
 
-        base_3m = self.base_head_3m(z)
         base_6m = self.base_head_6m(z)
-        base_12m = self.base_head_12m(z)
 
-        adj_3m = torch.zeros_like(base_3m)
         adj_6m = torch.zeros_like(base_6m)
-        adj_12m = torch.zeros_like(base_12m)
         all_attn = []
 
         for cid in country_ids.unique():
@@ -477,30 +464,21 @@ class DualPathTransformer(nn.Module):
             if mask.sum() < self.min_firms:
                 continue
             z_c = z[mask]
+            z_c = _cross_sectional_soft_norm(z_c)
             for block in self.blocks:
                 z_c, attn_w = block(z_c)
                 all_attn.append(attn_w)
-            adj_3m[mask] = self.adj_head_3m(z_c).squeeze(-1)
             adj_6m[mask] = self.adj_head_6m(z_c).squeeze(-1)
-            adj_12m[mask] = self.adj_head_12m(z_c).squeeze(-1)
 
         return {
-            "scores_3m": base_3m + adj_3m, "scores_6m": base_6m + adj_6m,
-            "scores_12m": base_12m + adj_12m, "base_3m": base_3m,
-            "base_6m": base_6m, "base_12m": base_12m,
+            "scores_6m": base_6m + adj_6m,
+            "base_6m": base_6m,
             "attn": all_attn, "agg": agg_info,
         }
 
 
 # Portfolio simulation
-
 def _renorm_over_valid(weights, valid):
-    """Renormalise a weight vector so the valid positions sum to one
-    (or to the input total). Firms with invalid forward returns are
-    dropped and their weight is redistributed proportionally to the
-    remaining positions. Without this, the portfolio silently holds
-    cash on delisted or NaN-return positions, which drags the realised
-    return down systematically."""
     if isinstance(weights, np.ndarray):
         valid_np = np.asarray(valid, dtype=bool)
         valid_total = float(weights[valid_np].sum())
@@ -553,19 +531,58 @@ def _firm_id_turnover(prev_ids, curr_ids):
     return (new_in + exited) / max(len(curr), 1)
 
 
+def _weight_l1_turnover(prev_ids, prev_w, curr_ids, curr_w):
+    if curr_ids is None or curr_w is None or len(curr_w) == 0:
+        return 0.0
+    curr_map = {}
+    for j in range(len(curr_ids)):
+        item = curr_ids[j]
+        fid = int(item.item()) if hasattr(item, "item") else int(item)
+        wj = curr_w[j]
+        curr_map[fid] = float(wj.item()) if hasattr(wj, "item") else float(wj)
+    if prev_ids is None or prev_w is None or len(prev_w) == 0:
+        return float(sum(abs(v) for v in curr_map.values()))
+    prev_map = {}
+    for j in range(len(prev_ids)):
+        item = prev_ids[j]
+        fid = int(item.item()) if hasattr(item, "item") else int(item)
+        wj = prev_w[j]
+        prev_map[fid] = float(wj.item()) if hasattr(wj, "item") else float(wj)
+    all_ids = set(prev_map.keys()) | set(curr_map.keys())
+    return float(sum(
+        abs(curr_map.get(fid, 0.0) - prev_map.get(fid, 0.0)) for fid in all_ids
+    ))
+
+
+def _drift_weights(prev_ids, prev_w, realised_returns_by_id):
+    if prev_ids is None or prev_w is None or len(prev_w) == 0:
+        return None, None
+    n = len(prev_w)
+    ids_list = []
+    growth = np.zeros(n, dtype=np.float64)
+    for j in range(n):
+        item = prev_ids[j]
+        fid = int(item.item()) if hasattr(item, "item") else int(item)
+        ids_list.append(fid)
+        w = prev_w[j]
+        w_val = float(w.item()) if hasattr(w, "item") else float(w)
+        r = float(realised_returns_by_id.get(fid, 0.0))
+        growth[j] = w_val * (1.0 + r)
+    g_sum = float(growth.sum())
+    if g_sum > 1e-12:
+        drifted = growth / g_sum
+    else:
+        drifted = growth
+    return ids_list, drifted
+
+
 def _ensemble_score(models, k0, k1, k0_miss, k1_miss, cids, key="scores_6m"):
     return torch.stack(
         [m(k0, k1, k0_miss, k1_miss, cids)[key] for m in models]
     ).mean(dim=0)
 
 
-def _seed_vol_history(models, val_dataset, config, rebalance_freq, leg_kind,
-                      score_key="scores_6m", target_key="target_6m"):
-    # score_key and target_key match the horizon being tested so the seed
-    # vol history is computed from the same prediction horizon and return
-    # target as the test simulation. without this, the leverage overlay
-    # would start the 3m and 12m test simulations with a vol estimate
-    # derived from the 6m signal, which is inconsistent.
+def _seed_vol_history(models, val_dataset, config, rebalance_freq, leg_kind, score_key="scores_6m", target_key="target_6m"):
     if not isinstance(models, (list, tuple)):
         models = [models]
     for m in models:
@@ -610,9 +627,46 @@ def _seed_vol_history(models, val_dataset, config, rebalance_freq, leg_kind,
     return returns[-n_vol_periods:] if returns else []
 
 
+def _seed_vol_history_monthly(models, val_dataset, config, rebalance_freq, leg_kind, score_key="scores_6m"):
+    n = max(1, config.vol_lookback_months)
+    if leg_kind == "long_only":
+        out = portfolio_simulation_monthly(
+            models, val_dataset, config,
+            rebalance_freq=rebalance_freq, tc_bps=config.tc_bps,
+            seed_returns=None, record_holdings=False, score_key=score_key,
+        )
+    elif leg_kind == "long_short":
+        out = portfolio_simulation_long_short_monthly(
+            models, val_dataset, config,
+            rebalance_freq=rebalance_freq, tc_bps=config.tc_bps,
+            seed_returns=None, record_holdings=False, score_key=score_key,
+        )
+    elif leg_kind == "country_long_only":
+        out = portfolio_simulation_country_composite_monthly(
+            models, val_dataset, config,
+            rebalance_freq=rebalance_freq, tc_bps=config.tc_bps,
+            long_short=False, seed_returns=None,
+            record_holdings=False, score_key=score_key,
+        )
+    else:
+        out = portfolio_simulation_country_composite_monthly(
+            models, val_dataset, config,
+            rebalance_freq=rebalance_freq, tc_bps=config.tc_bps,
+            long_short=True, seed_returns=None,
+            record_holdings=False, score_key=score_key,
+        )
+    # out[1] is the unscaled monthly return series from the val simulation.
+    # the vol overlay in the simulation functions tracks raw (pre-tc) leg
+    # returns, which differ from unscaled (post-tc) by the transaction cost
+    # applied at rebalance months. the difference is negligible (tc ~ 25bps
+    # times turnover per rebalance, spread across 6 monthly observations),
+    # so using the unscaled series as the seed is accurate enough in practice.
+    unscaled = out[1]
+    return list(unscaled[-n:]) if len(unscaled) >= n else list(unscaled)
+
+
 @torch.no_grad()
-def portfolio_simulation(models, dataset, config, rebalance_freq=6, tc_bps=25,
-                         seed_returns=None, record_holdings=False,
+def portfolio_simulation(models, dataset, config, rebalance_freq=6, tc_bps=25, seed_returns=None, record_holdings=False,
                          score_key="scores_6m", target_key="target_6m"):
     if not isinstance(models, (list, tuple)):
         models = [models]
@@ -623,7 +677,9 @@ def portfolio_simulation(models, dataset, config, rebalance_freq=6, tc_bps=25,
     portfolio_returns = []
     unscaled_returns = []
     raw_returns_hist = list(seed_returns) if seed_returns else []
-    prev_firm_ids = None
+    prev_firm_ids_seq = None
+    prev_weights_seq = None
+    prev_realised_returns_seq = None
     holdings = []
     leverage_trace = []
 
@@ -640,7 +696,7 @@ def portfolio_simulation(models, dataset, config, rebalance_freq=6, tc_bps=25,
         scores = _ensemble_score(models, k0, k1, k0_miss, k1_miss, cids, key=score_key)
         n_firms = scores.shape[0]
 
-        # all stocks — softmax-weighted by predicted score, no quantile cutoff
+        # all stocks: softmax-weighted by predicted score, no quantile cutoff
         top_idx_np = np.arange(n_firms)
         top_firm_ids = firm_ids
 
@@ -655,16 +711,28 @@ def portfolio_simulation(models, dataset, config, rebalance_freq=6, tc_bps=25,
         # holding cash on missing positions.
         weights = _renorm_over_valid(weights, valid)
         leg_return = 0.0
+        firm_realised_returns = {}
+        weights_np = weights.detach().cpu().numpy().astype(np.float64)
+        ids_list = [int(firm_ids[fi].item()) for fi in range(n_firms)]
         for fi in range(n_firms):
-            if valid[fi]:
-                leg_return += weights[fi].item() * raw_returns[fi].item()
+            r = float(raw_returns[fi].item()) if valid[fi] else 0.0
+            firm_realised_returns[ids_list[fi]] = r
+            leg_return += weights_np[fi] * r
 
-        base_turnover = _firm_id_turnover(prev_firm_ids, top_firm_ids)
+        if prev_firm_ids_seq is not None:
+            drifted_ids, drifted_w = _drift_weights(
+                prev_firm_ids_seq, prev_weights_seq, prev_realised_returns_seq,
+            )
+        else:
+            drifted_ids, drifted_w = None, None
+        base_turnover = _weight_l1_turnover(
+            drifted_ids, drifted_w, ids_list, weights_np,
+        )
 
         n_vol_periods = max(1, config.vol_lookback_months // rebalance_freq)
         if len(raw_returns_hist) >= n_vol_periods:
             recent = np.array(raw_returns_hist[-n_vol_periods:])
-            realised_vol = recent.std() * np.sqrt(periods_per_year)
+            realised_vol = recent.std(ddof=1) * np.sqrt(periods_per_year)
             leverage = config.target_vol / max(realised_vol, 1e-6)
             leverage = float(np.clip(
                 leverage,
@@ -679,7 +747,11 @@ def portfolio_simulation(models, dataset, config, rebalance_freq=6, tc_bps=25,
         portfolio_returns.append(leverage * leg_return - tc)
         unscaled_returns.append(leg_return - flat_tc)
         raw_returns_hist.append(leg_return)
-        prev_firm_ids = top_firm_ids
+
+        # save state for the next rebalance's drift accounting
+        prev_firm_ids_seq = ids_list
+        prev_weights_seq = weights_np
+        prev_realised_returns_seq = firm_realised_returns
 
         if record_holdings:
             rebal_idx = idx // rebalance_freq
@@ -706,8 +778,7 @@ def portfolio_simulation(models, dataset, config, rebalance_freq=6, tc_bps=25,
 
 
 @torch.no_grad()
-def portfolio_simulation_long_short(models, dataset, config, rebalance_freq=6, tc_bps=25,
-                                    seed_returns=None, record_holdings=False,
+def portfolio_simulation_long_short(models, dataset, config, rebalance_freq=6, tc_bps=25, seed_returns=None, record_holdings=False,
                                     score_key="scores_6m", target_key="target_6m"):
     if not isinstance(models, (list, tuple)):
         models = [models]
@@ -718,8 +789,13 @@ def portfolio_simulation_long_short(models, dataset, config, rebalance_freq=6, t
     portfolio_returns = []
     unscaled_returns = []
     raw_ls_returns = list(seed_returns) if seed_returns else []
-    prev_long_ids = None
-    prev_short_ids = None
+    # state for drift-based turnover accounting on each leg
+    prev_long_ids_seq = None
+    prev_long_weights_seq = None
+    prev_long_realised_returns_seq = None
+    prev_short_ids_seq = None
+    prev_short_weights_seq = None
+    prev_short_realised_returns_seq = None
     holdings = []
     leverage_trace = []
 
@@ -747,12 +823,8 @@ def portfolio_simulation_long_short(models, dataset, config, rebalance_freq=6, t
         long_firm_ids = firm_ids[long_idx_np]
         short_firm_ids = firm_ids[short_idx_np]
 
-        long_w = _capped_softmax_weights(
-            scores[long_idx] - mean_score, config.max_position_weight
-        )
-        short_w = _capped_softmax_weights(
-            mean_score - scores[short_idx], config.max_position_weight
-        )
+        long_w = _capped_softmax_weights(scores[long_idx] - mean_score, config.max_position_weight)
+        short_w = _capped_softmax_weights(mean_score - scores[short_idx], config.max_position_weight)
 
         raw_returns = batch["targets"][target_key]
         valid = batch["valid_masks"][target_key]
@@ -763,24 +835,47 @@ def portfolio_simulation_long_short(models, dataset, config, rebalance_freq=6, t
         short_valid = valid[short_idx_np]
         long_w = _renorm_over_valid(long_w, long_valid)
         short_w = _renorm_over_valid(short_w, short_valid)
+        long_w_np = long_w.detach().cpu().numpy().astype(np.float64)
+        short_w_np = short_w.detach().cpu().numpy().astype(np.float64)
+        long_ids_list = [int(long_firm_ids[i].item()) for i in range(len(long_firm_ids))]
+        short_ids_list = [int(short_firm_ids[i].item()) for i in range(len(short_firm_ids))]
+        long_realised = {}
+        short_realised = {}
         long_ret = 0.0
         for i, fi in enumerate(long_idx_np):
-            if valid[fi]:
-                long_ret += long_w[i].item() * raw_returns[fi].item()
+            r = float(raw_returns[fi].item()) if valid[fi] else 0.0
+            long_realised[long_ids_list[i]] = r
+            long_ret += long_w_np[i] * r
         short_ret = 0.0
         for i, fi in enumerate(short_idx_np):
-            if valid[fi]:
-                short_ret += short_w[i].item() * raw_returns[fi].item()
+            r = float(raw_returns[fi].item()) if valid[fi] else 0.0
+            short_realised[short_ids_list[i]] = r
+            short_ret += short_w_np[i] * r
         ls_ret = long_ret - short_ret
 
-        lt = _firm_id_turnover(prev_long_ids, long_firm_ids)
-        st = _firm_id_turnover(prev_short_ids, short_firm_ids)
+        # drift previous leg weights forward by their realised returns
+        if prev_long_ids_seq is not None:
+            d_long_ids, d_long_w = _drift_weights(
+                prev_long_ids_seq, prev_long_weights_seq,
+                prev_long_realised_returns_seq,
+            )
+        else:
+            d_long_ids, d_long_w = None, None
+        if prev_short_ids_seq is not None:
+            d_short_ids, d_short_w = _drift_weights(
+                prev_short_ids_seq, prev_short_weights_seq,
+                prev_short_realised_returns_seq,
+            )
+        else:
+            d_short_ids, d_short_w = None, None
+        lt = _weight_l1_turnover(d_long_ids, d_long_w, long_ids_list, long_w_np)
+        st = _weight_l1_turnover(d_short_ids, d_short_w, short_ids_list, short_w_np)
         base_turnover = lt + st
 
         n_vol_periods = max(1, config.vol_lookback_months // rebalance_freq)
         if len(raw_ls_returns) >= n_vol_periods:
             recent = np.array(raw_ls_returns[-n_vol_periods:])
-            realised_vol = recent.std() * np.sqrt(periods_per_year)
+            realised_vol = recent.std(ddof=1) * np.sqrt(periods_per_year)
             leverage = config.target_vol / max(realised_vol, 1e-6)
             leverage = float(np.clip(
                 leverage, 1.0 / config.max_leverage_long_short,
@@ -794,8 +889,14 @@ def portfolio_simulation_long_short(models, dataset, config, rebalance_freq=6, t
         portfolio_returns.append(leverage * ls_ret - tc)
         unscaled_returns.append(ls_ret - flat_tc)
         raw_ls_returns.append(ls_ret)
-        prev_long_ids = long_firm_ids
-        prev_short_ids = short_firm_ids
+
+        # save state for the next rebalance's drift accounting
+        prev_long_ids_seq = long_ids_list
+        prev_long_weights_seq = long_w_np
+        prev_long_realised_returns_seq = long_realised
+        prev_short_ids_seq = short_ids_list
+        prev_short_weights_seq = short_w_np
+        prev_short_realised_returns_seq = short_realised
 
         if record_holdings:
             rebal_idx = idx // rebalance_freq
@@ -851,9 +952,18 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
     portfolio_returns = []
     unscaled_returns = []
     raw_composite_returns = list(seed_returns) if seed_returns else []
+    # state per country for drift-based turnover accounting. each
+    # dictionary maps an integer country id to the relevant array or
+    # mapping from the previous rebalance for that country.
     prev_long_ids = {}
+    prev_long_w = {}
+    prev_long_realised = {}
     prev_short_ids = {}
+    prev_short_w = {}
+    prev_short_realised = {}
     prev_top_ids = {}
+    prev_top_w = {}
+    prev_top_realised = {}
     holdings = []
     leverage_trace = []
     per_country = {}
@@ -895,6 +1005,7 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
             n_firms_c = len(idxs)
             if n_firms_c < config.min_firms_country:
                 continue
+            cid_int = int(cid)
 
             idxs_t = torch.as_tensor(idxs, device=device, dtype=torch.long)
             scores_c = scores[idxs_t]
@@ -909,36 +1020,64 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
                 long_firm_ids_c = firm_ids[long_pos]
                 short_firm_ids_c = firm_ids[short_pos]
 
-                lt = _firm_id_turnover(prev_long_ids.get(cid), long_firm_ids_c)
-                st = _firm_id_turnover(prev_short_ids.get(cid), short_firm_ids_c)
-                turnover_c = lt + st
-
-                # equal weighting within each country leg, matching the
-                # fama-french factor portfolio convention.
+                long_local_scores = scores_c[long_local]
+                short_local_scores = scores_c[short_local]
                 n_long_c = len(long_pos)
                 n_short_c = len(short_pos)
-                long_w = torch.full(
-                    (n_long_c,), 1.0 / max(n_long_c, 1), dtype=torch.float32,
+                long_w = _capped_softmax_weights(
+                    long_local_scores - mean_c, config.max_position_weight,
                 )
-                short_w = torch.full(
-                    (n_short_c,), 1.0 / max(n_short_c, 1), dtype=torch.float32,
+                short_w = _capped_softmax_weights(
+                    mean_c - short_local_scores, config.max_position_weight,
                 )
                 # renormalise over valid firms within this country leg
                 long_valid_c = valid[long_pos]
                 short_valid_c = valid[short_pos]
                 long_w = _renorm_over_valid(long_w, long_valid_c)
                 short_w = _renorm_over_valid(short_w, short_valid_c)
+                long_w_np = long_w.detach().cpu().numpy().astype(np.float64)
+                short_w_np = short_w.detach().cpu().numpy().astype(np.float64)
+                long_ids_list = [int(long_firm_ids_c[i].item()) for i in range(n_long_c)]
+                short_ids_list = [int(short_firm_ids_c[i].item()) for i in range(n_short_c)]
+                long_realised = {}
+                short_realised = {}
                 long_ret = 0.0
                 for i, fi in enumerate(long_pos):
-                    if valid[fi]:
-                        long_ret += long_w[i].item() * raw_returns[fi].item()
+                    r = float(raw_returns[fi].item()) if valid[fi] else 0.0
+                    long_realised[long_ids_list[i]] = r
+                    long_ret += long_w_np[i] * r
                 short_ret = 0.0
                 for i, fi in enumerate(short_pos):
-                    if valid[fi]:
-                        short_ret += short_w[i].item() * raw_returns[fi].item()
-                country_returns[int(cid)] = long_ret - short_ret
-                prev_long_ids[cid] = long_firm_ids_c
-                prev_short_ids[cid] = short_firm_ids_c
+                    r = float(raw_returns[fi].item()) if valid[fi] else 0.0
+                    short_realised[short_ids_list[i]] = r
+                    short_ret += short_w_np[i] * r
+
+                # drift previous country leg weights and compute L1
+                if cid_int in prev_long_ids:
+                    d_long_ids, d_long_w = _drift_weights(
+                        prev_long_ids[cid_int], prev_long_w[cid_int],
+                        prev_long_realised[cid_int],
+                    )
+                else:
+                    d_long_ids, d_long_w = None, None
+                if cid_int in prev_short_ids:
+                    d_short_ids, d_short_w = _drift_weights(
+                        prev_short_ids[cid_int], prev_short_w[cid_int],
+                        prev_short_realised[cid_int],
+                    )
+                else:
+                    d_short_ids, d_short_w = None, None
+                lt = _weight_l1_turnover(d_long_ids, d_long_w, long_ids_list, long_w_np)
+                st = _weight_l1_turnover(d_short_ids, d_short_w, short_ids_list, short_w_np)
+                turnover_c = lt + st
+
+                country_returns[cid_int] = long_ret - short_ret
+                prev_long_ids[cid_int] = long_ids_list
+                prev_long_w[cid_int] = long_w_np
+                prev_long_realised[cid_int] = long_realised
+                prev_short_ids[cid_int] = short_ids_list
+                prev_short_w[cid_int] = short_w_np
+                prev_short_realised[cid_int] = short_realised
 
                 if record_holdings:
                     for i, fi in enumerate(long_pos):
@@ -962,25 +1101,42 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
                             ),
                         })
             else:
-                # all firms in country, softmax-weighted — no quantile cutoff
+                # all firms in country, capped softmax over raw score,
+                # matching the global long only construction.
                 top_pos = idxs
                 top_firm_ids_c = firm_ids[top_pos]
-
-                turnover_c = _firm_id_turnover(prev_top_ids.get(cid), top_firm_ids_c)
-
-                # equal weighting within country for the long-only leg too
                 n_top_c = len(top_pos)
-                top_w = torch.full(
-                    (n_top_c,), 1.0 / max(n_top_c, 1), dtype=torch.float32,
+
+                top_scores_c = scores_c
+                top_w = _capped_softmax_weights(
+                    top_scores_c, config.max_position_weight,
                 )
                 top_valid_c = valid[top_pos]
                 top_w = _renorm_over_valid(top_w, top_valid_c)
+                top_w_np = top_w.detach().cpu().numpy().astype(np.float64)
+                top_ids_list = [int(top_firm_ids_c[i].item()) for i in range(n_top_c)]
+                top_realised = {}
                 top_ret = 0.0
                 for i, fi in enumerate(top_pos):
-                    if valid[fi]:
-                        top_ret += top_w[i].item() * raw_returns[fi].item()
-                country_returns[int(cid)] = top_ret
-                prev_top_ids[cid] = top_firm_ids_c
+                    r = float(raw_returns[fi].item()) if valid[fi] else 0.0
+                    top_realised[top_ids_list[i]] = r
+                    top_ret += top_w_np[i] * r
+
+                if cid_int in prev_top_ids:
+                    d_top_ids, d_top_w = _drift_weights(
+                        prev_top_ids[cid_int], prev_top_w[cid_int],
+                        prev_top_realised[cid_int],
+                    )
+                else:
+                    d_top_ids, d_top_w = None, None
+                turnover_c = _weight_l1_turnover(
+                    d_top_ids, d_top_w, top_ids_list, top_w_np,
+                )
+
+                country_returns[cid_int] = top_ret
+                prev_top_ids[cid_int] = top_ids_list
+                prev_top_w[cid_int] = top_w_np
+                prev_top_realised[cid_int] = top_realised
 
                 if record_holdings:
                     for i, fi in enumerate(top_pos):
@@ -988,15 +1144,15 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
                             "rebalance_index": rebal_idx, "eom": eom_ts,
                             "portfolio": portfolio_label, "leg": "long",
                             "country_id": int(cid), "id": int(firm_ids[fi].item()),
-                            "weight": float(top_w[i].item()),  # softmax weight
+                            "weight": float(top_w[i].item()),
                             "realised_return": (
                                 float(raw_returns[fi].item()) if valid[fi] else float("nan")
                             ),
                         })
 
-            country_costs[int(cid)] = turnover_c * tc_bps / 10000.0
+            country_costs[cid_int] = turnover_c * tc_bps / 10000.0
             cap = market_cap[idxs].sum().item()
-            country_market_caps[int(cid)] = cap if cap > 0 else float(n_firms_c)
+            country_market_caps[cid_int] = cap if cap > 0 else float(n_firms_c)
 
         if not country_returns:
             portfolio_returns.append(0.0)
@@ -1023,7 +1179,7 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
         n_vol_periods = max(1, config.vol_lookback_months // rebalance_freq)
         if len(raw_composite_returns) >= n_vol_periods:
             recent = np.array(raw_composite_returns[-n_vol_periods:])
-            realised_vol = recent.std() * np.sqrt(periods_per_year)
+            realised_vol = recent.std(ddof=1) * np.sqrt(periods_per_year)
             leverage = config.target_vol / max(realised_vol, 1e-6)
             leverage = float(np.clip(
                 leverage, 1.0 / leverage_bound, leverage_bound,
@@ -1045,7 +1201,7 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
 
     returns_arr = np.array(portfolio_returns)
     unscaled_arr = np.array(unscaled_returns)
-    out = [returns_arr, unscaled_arr]
+    out: list = [returns_arr, unscaled_arr]
     if record_holdings:
         out.append(holdings)
         out.append(leverage_trace)
@@ -1057,20 +1213,8 @@ def portfolio_simulation_country_composite(models, dataset, config, rebalance_fr
 # Metrics
 
 @torch.no_grad()
-def portfolio_simulation_monthly(models, dataset, config, rebalance_freq=6, tc_bps=25,
-                                 seed_returns=None, record_holdings=False,
+def portfolio_simulation_monthly(models, dataset, config, rebalance_freq=6, tc_bps=25, seed_returns=None, record_holdings=False,
                                  score_key="scores_6m"):
-    """Long-only monthly simulation.
-
-    Positions are formed every `rebalance_freq` months using the model's
-    predictions at the rebalance date. Between rebalances, held positions
-    earn the realised one-month forward excess return (target_1m) for each
-    intervening month. Transaction costs are charged at rebalance months
-    only. Volatility overlay uses a monthly history window.
-
-    Returns a tuple (scaled_monthly_returns, unscaled_monthly_returns,
-    holdings, leverage_trace) of length 4 if record_holdings else length 2.
-    """
     if not isinstance(models, (list, tuple)):
         models = [models]
     for m in models:
@@ -1081,12 +1225,11 @@ def portfolio_simulation_monthly(models, dataset, config, rebalance_freq=6, tc_b
     monthly_scaled = []
     monthly_unscaled = []
     raw_monthly_hist = list(seed_returns) if seed_returns else []
-    prev_firm_ids = None
     holdings = []
     leverage_trace = []
     n_vol_periods = max(1, config.vol_lookback_months)
 
-    held_weights = None
+    held_drifted_w = None
     held_firm_ids = None
     held_n = 0
     current_leverage = 1.0
@@ -1110,16 +1253,31 @@ def portfolio_simulation_monthly(models, dataset, config, rebalance_freq=6, tc_b
                 models, k0, k1, k0_miss, k1_miss, cids, key=score_key,
             )
             held_weights = _capped_softmax_weights(scores, config.max_position_weight)
+            # save the drifted weights from the previous period so we can
+            # compute the L1 turnover against them BEFORE overwriting the
+            # held state with this period's fresh target weights.
+            prev_drifted_ids = ([int(held_firm_ids[i].item()) for i in range(held_n)]
+                if held_drifted_w is not None else None
+            )
+            prev_drifted_w = (held_drifted_w.copy() if held_drifted_w is not None else None)
+
             held_firm_ids = firm_ids
             held_n = n_firms
+            # drifted weights start at the capped softmax weights at the
+            # rebalance and evolve buy-and-hold between rebalances
+            held_drifted_w = held_weights.detach().cpu().numpy().astype(np.float64).copy()
+            curr_ids_list = [int(firm_ids[i].item()) for i in range(n_firms)]
 
-            base_turnover = _firm_id_turnover(prev_firm_ids, held_firm_ids)
+            base_turnover = _weight_l1_turnover(
+                prev_drifted_ids, prev_drifted_w,
+                curr_ids_list, held_drifted_w,
+            )
             flat_tc = base_turnover * tc_bps / 10000.0
 
             # update leverage on rebalance month based on monthly history
             if len(raw_monthly_hist) >= n_vol_periods:
                 recent = np.array(raw_monthly_hist[-n_vol_periods:])
-                realised_vol = recent.std() * np.sqrt(periods_per_year)
+                realised_vol = recent.std(ddof=1) * np.sqrt(periods_per_year)
                 lev = config.target_vol / max(realised_vol, 1e-6)
                 current_leverage = float(np.clip(
                     lev,
@@ -1128,8 +1286,6 @@ def portfolio_simulation_monthly(models, dataset, config, rebalance_freq=6, tc_b
                 ))
             else:
                 current_leverage = 1.0
-
-            prev_firm_ids = held_firm_ids
 
             if record_holdings:
                 rebal_idx = idx // rebalance_freq
@@ -1149,44 +1305,39 @@ def portfolio_simulation_monthly(models, dataset, config, rebalance_freq=6, tc_b
                     })
 
         # if not yet rebalanced or no holdings, this month earns zero
-        if held_weights is None or held_n == 0:
+        if held_drifted_w is None or held_n == 0:
             monthly_scaled.append(0.0)
             monthly_unscaled.append(0.0)
             raw_monthly_hist.append(0.0)
             continue
 
-        # match held positions to this month's firms by firm id
-        # since held positions were locked at the most recent rebalance,
-        # we need to look up monthly returns for those exact firm ids
-        # in the current month's batch.
         raw_returns = batch["targets"]["target_1m"]
         valid = batch["valid_masks"]["target_1m"]
 
-        # build a position-by-position match: only positions whose firm id
-        # appears in the current month's universe AND has valid return
-        # contribute. weights are renormalised over the valid subset so the
-        # portfolio stays fully invested in firms that still trade.
-        current_id_set = set(firm_ids.tolist())
+        # match held positions to this month's firms by firm id. positions
+        # whose firm id is absent or marked invalid this month earn zero
+        # (cash held until next rebalance), which causes their drifted
+        # weight to decline relative to surviving names if the rest of
+        # the portfolio is up, and to rise if it is down.
         current_id_to_idx = {
             int(firm_ids[i].item()): i for i in range(n_firms)
         }
-        contrib_weights = []
-        contrib_returns = []
+        r_array = np.zeros(held_n, dtype=np.float64)
         for held_idx in range(held_n):
             held_id = int(held_firm_ids[held_idx].item())
             if held_id in current_id_to_idx:
                 cur_pos = current_id_to_idx[held_id]
                 if valid[cur_pos]:
-                    contrib_weights.append(float(held_weights[held_idx].item()))
-                    contrib_returns.append(float(raw_returns[cur_pos].item()))
+                    r_array[held_idx] = float(raw_returns[cur_pos].item())
 
-        if contrib_weights:
-            cw = np.array(contrib_weights)
-            cr = np.array(contrib_returns)
-            cw = cw / cw.sum() if cw.sum() > 0 else cw
-            leg_return = float((cw * cr).sum())
-        else:
-            leg_return = 0.0
+        # monthly leg return computed on the drifted weights
+        leg_return = float((held_drifted_w * r_array).sum())
+
+        # update drifted weights for the following month
+        growth = held_drifted_w * (1.0 + r_array)
+        g_sum = float(growth.sum())
+        if g_sum > 1e-12:
+            held_drifted_w = growth / g_sum
 
         tc = current_leverage * flat_tc
         monthly_scaled.append(current_leverage * leg_return - tc)
@@ -1201,16 +1352,8 @@ def portfolio_simulation_monthly(models, dataset, config, rebalance_freq=6, tc_b
 
 
 @torch.no_grad()
-def portfolio_simulation_long_short_monthly(models, dataset, config,
-                                            rebalance_freq=6, tc_bps=25,
-                                            seed_returns=None, record_holdings=False,
+def portfolio_simulation_long_short_monthly(models, dataset, config, rebalance_freq=6, tc_bps=25, seed_returns=None, record_holdings=False,
                                             score_key="scores_6m"):
-    """Long-short monthly simulation with mean-split position formation.
-
-    Same monthly accumulation logic as portfolio_simulation_monthly but with
-    two legs. Held long and short weights are locked at each rebalance month
-    and earn one-month forward returns until the next rebalance.
-    """
     if not isinstance(models, (list, tuple)):
         models = [models]
     for m in models:
@@ -1221,15 +1364,13 @@ def portfolio_simulation_long_short_monthly(models, dataset, config,
     monthly_scaled = []
     monthly_unscaled = []
     raw_monthly_hist = list(seed_returns) if seed_returns else []
-    prev_long_ids = None
-    prev_short_ids = None
     holdings = []
     leverage_trace = []
     n_vol_periods = max(1, config.vol_lookback_months)
 
-    held_long_w = None
+    held_long_drifted_w = None
     held_long_ids = None
-    held_short_w = None
+    held_short_drifted_w = None
     held_short_ids = None
     current_leverage = 1.0
 
@@ -1267,19 +1408,36 @@ def portfolio_simulation_long_short_monthly(models, dataset, config,
                 mean_score - scores[short_idx], config.max_position_weight,
             )
 
-            held_long_w = long_w
-            held_long_ids = long_firm_ids
-            held_short_w = short_w
-            held_short_ids = short_firm_ids
+            # save drifted weights from the previous period BEFORE
+            # overwriting with the fresh target weights, so the L1
+            # turnover compares the drifted incumbent positions against
+            # the new target.
+            prev_drifted_long_ids = ([int(held_long_ids[i].item()) for i in range(len(held_long_ids))]
+                if held_long_drifted_w is not None else None
+            )
+            prev_drifted_long_w = (held_long_drifted_w.copy() if held_long_drifted_w is not None else None)
+            prev_drifted_short_ids = (
+                [int(held_short_ids[i].item()) for i in range(len(held_short_ids))]
+                if held_short_drifted_w is not None else None
+            )
+            prev_drifted_short_w = (held_short_drifted_w.copy() if held_short_drifted_w is not None else None)
 
-            lt = _firm_id_turnover(prev_long_ids, long_firm_ids)
-            st = _firm_id_turnover(prev_short_ids, short_firm_ids)
+            held_long_ids = long_firm_ids
+            held_short_ids = short_firm_ids
+            # drifted weights start at the capped softmax weights
+            held_long_drifted_w = long_w.detach().cpu().numpy().astype(np.float64).copy()
+            held_short_drifted_w = short_w.detach().cpu().numpy().astype(np.float64).copy()
+            curr_long_ids_list = [int(long_firm_ids[i].item()) for i in range(len(long_firm_ids))]
+            curr_short_ids_list = [int(short_firm_ids[i].item()) for i in range(len(short_firm_ids))]
+
+            lt = _weight_l1_turnover(prev_drifted_long_ids, prev_drifted_long_w, curr_long_ids_list, held_long_drifted_w)
+            st = _weight_l1_turnover(prev_drifted_short_ids, prev_drifted_short_w, curr_short_ids_list, held_short_drifted_w)
             base_turnover = lt + st
             flat_tc = base_turnover * tc_bps / 10000.0
 
             if len(raw_monthly_hist) >= n_vol_periods:
                 recent = np.array(raw_monthly_hist[-n_vol_periods:])
-                realised_vol = recent.std() * np.sqrt(periods_per_year)
+                realised_vol = recent.std(ddof=1) * np.sqrt(periods_per_year)
                 lev = config.target_vol / max(realised_vol, 1e-6)
                 current_leverage = float(np.clip(
                     lev,
@@ -1288,9 +1446,6 @@ def portfolio_simulation_long_short_monthly(models, dataset, config,
                 ))
             else:
                 current_leverage = 1.0
-
-            prev_long_ids = long_firm_ids
-            prev_short_ids = short_firm_ids
 
             if record_holdings:
                 rebal_idx = idx // rebalance_freq
@@ -1301,7 +1456,7 @@ def portfolio_simulation_long_short_monthly(models, dataset, config,
                     "leverage": float(current_leverage),
                 })
 
-        if held_long_w is None:
+        if held_long_drifted_w is None:
             monthly_scaled.append(0.0)
             monthly_unscaled.append(0.0)
             raw_monthly_hist.append(0.0)
@@ -1313,25 +1468,23 @@ def portfolio_simulation_long_short_monthly(models, dataset, config,
             int(firm_ids[i].item()): i for i in range(n_firms)
         }
 
-        def _leg_return(held_ids, held_w):
-            cw_list = []
-            cr_list = []
-            for held_idx in range(len(held_ids)):
-                held_id = int(held_ids[held_idx].item())
+        def _step_leg(held_ids, drifted_w):
+            n_held = len(drifted_w)
+            r_array = np.zeros(n_held, dtype=np.float64)
+            for j in range(n_held):
+                held_id = int(held_ids[j].item())
                 if held_id in current_id_to_idx:
                     cur_pos = current_id_to_idx[held_id]
                     if valid[cur_pos]:
-                        cw_list.append(float(held_w[held_idx].item()))
-                        cr_list.append(float(raw_returns[cur_pos].item()))
-            if not cw_list:
-                return 0.0
-            cw = np.array(cw_list)
-            cr = np.array(cr_list)
-            cw = cw / cw.sum() if cw.sum() > 0 else cw
-            return float((cw * cr).sum())
+                        r_array[j] = float(raw_returns[cur_pos].item())
+            leg_ret = float((drifted_w * r_array).sum())
+            growth = drifted_w * (1.0 + r_array)
+            g_sum = float(growth.sum())
+            new_drifted_w = growth / g_sum if g_sum > 1e-12 else drifted_w
+            return leg_ret, new_drifted_w
 
-        long_ret = _leg_return(held_long_ids, held_long_w)
-        short_ret = _leg_return(held_short_ids, held_short_w)
+        long_ret, held_long_drifted_w = _step_leg(held_long_ids, held_long_drifted_w)
+        short_ret, held_short_drifted_w = _step_leg(held_short_ids, held_short_drifted_w)
         ls_ret = long_ret - short_ret
 
         tc = current_leverage * flat_tc
@@ -1347,19 +1500,18 @@ def portfolio_simulation_long_short_monthly(models, dataset, config,
 
 
 @torch.no_grad()
-def portfolio_simulation_country_composite_monthly(models, dataset, config,
-                                                   rebalance_freq=6, tc_bps=25,
-                                                   long_short=True,
-                                                   seed_returns=None,
-                                                   record_holdings=False,
-                                                   score_key="scores_6m"):
+def portfolio_simulation_country_composite_monthly(models, dataset, config, rebalance_freq=6, tc_bps=25, long_short=True,
+                                                   seed_returns=None, record_holdings=False, score_key="scores_6m"):
     """Country composite monthly simulation.
-
-    At each rebalance month, per-country positions are formed using mean-split
-    (long-short) or full universe (long-only). Country-level weights inside
-    each leg are equal-weighted. Between rebalances, held positions earn
-    one-month forward returns. Country returns are aggregated using market
-    cap weights computed at each monthly cross-section.
+    At each rebalance month, per-country positions are formed using
+    mean-split (long-short) or full universe (long-only). Within-country
+    weighting is capped softmax over the score, matching the global
+    construction, rather than equal weighting. Country-level weights
+    drift buy-and-hold between rebalances. The drift ensures that the
+    monthly country leg return compounds to the same six month
+    buy-and-hold country return at each rebalance boundary. Country
+    returns are aggregated using market cap weights computed at each
+    monthly cross section.
     """
     if not isinstance(models, (list, tuple)):
         models = [models]
@@ -1373,22 +1525,17 @@ def portfolio_simulation_country_composite_monthly(models, dataset, config,
     raw_monthly_hist = list(seed_returns) if seed_returns else []
     n_vol_periods = max(1, config.vol_lookback_months)
 
-    leverage_bound = (
-        config.max_leverage_long_short if long_short
-        else config.max_leverage_long_only
-    )
-    portfolio_label = (
-        "country_composite_long_short_monthly" if long_short
-        else "country_composite_long_only_monthly"
-    )
+    leverage_bound = (config.max_leverage_long_short if long_short else config.max_leverage_long_only)
+    portfolio_label = ("country_composite_long_short_monthly" if long_short else "country_composite_long_only_monthly")
 
     # held positions per country
     held_long_ids = {}
     held_short_ids = {}
     held_top_ids = {}
-    prev_long_ids = {}
-    prev_short_ids = {}
-    prev_top_ids = {}
+    # drifted within-country weights per country, parallel to the id lists
+    held_long_drifted_w = {}
+    held_short_drifted_w = {}
+    held_top_drifted_w = {}
     current_leverage = 1.0
 
     holdings = []
@@ -1411,13 +1558,33 @@ def portfolio_simulation_country_composite_monthly(models, dataset, config,
             k0_miss = batch["k0_miss"].to(device)
             k1_miss = batch["k1_miss"].to(device)
             cids_dev = cids.to(device)
-            scores = _ensemble_score(
-                models, k0, k1, k0_miss, k1_miss, cids_dev, key=score_key,
-            )
+            scores = _ensemble_score(models, k0, k1, k0_miss, k1_miss, cids_dev, key=score_key)
+
+            # snapshot of the previous period's drifted weights, used for
+            # the L1 turnover calculation BEFORE the held state is
+            # overwritten with this period's fresh target weights.
+            prev_drifted_long_ids = {
+                c: [int(held_long_ids[c][i].item()) for i in range(len(held_long_ids[c]))]
+                for c in held_long_ids
+            }
+            prev_drifted_long_w = {c: held_long_drifted_w[c].copy() for c in held_long_drifted_w}
+            prev_drifted_short_ids = {
+                c: [int(held_short_ids[c][i].item()) for i in range(len(held_short_ids[c]))]
+                for c in held_short_ids
+            }
+            prev_drifted_short_w = {c: held_short_drifted_w[c].copy() for c in held_short_drifted_w}
+            prev_drifted_top_ids = {
+                c: [int(held_top_ids[c][i].item()) for i in range(len(held_top_ids[c]))]
+                for c in held_top_ids
+            }
+            prev_drifted_top_w = {c: held_top_drifted_w[c].copy() for c in held_top_drifted_w}
 
             held_long_ids = {}
             held_short_ids = {}
             held_top_ids = {}
+            held_long_drifted_w = {}
+            held_short_drifted_w = {}
+            held_top_drifted_w = {}
 
             for cid in np.unique(country_ids_np):
                 if cid < 0:
@@ -1437,21 +1604,37 @@ def portfolio_simulation_country_composite_monthly(models, dataset, config,
                     short_pos = idxs[short_local.cpu().numpy()]
                     held_long_ids[cid_int] = firm_ids[long_pos]
                     held_short_ids[cid_int] = firm_ids[short_pos]
+                    long_w_c = _capped_softmax_weights(
+                        scores_c[long_local] - mean_c, config.max_position_weight,
+                    )
+                    short_w_c = _capped_softmax_weights(mean_c - scores_c[short_local], config.max_position_weight)
+                    held_long_drifted_w[cid_int] = (long_w_c.detach().cpu().numpy().astype(np.float64))
+                    held_short_drifted_w[cid_int] = (short_w_c.detach().cpu().numpy().astype(np.float64))
 
-                    lt = _firm_id_turnover(prev_long_ids.get(cid_int), held_long_ids[cid_int])
-                    st = _firm_id_turnover(prev_short_ids.get(cid_int), held_short_ids[cid_int])
+                    curr_long_ids = [int(firm_ids[p].item()) for p in long_pos]
+                    curr_short_ids = [int(firm_ids[p].item()) for p in short_pos]
+                    lt = _weight_l1_turnover(prev_drifted_long_ids.get(cid_int), prev_drifted_long_w.get(cid_int),
+                        curr_long_ids, held_long_drifted_w[cid_int]
+                    )
+                    st = _weight_l1_turnover(prev_drifted_short_ids.get(cid_int), prev_drifted_short_w.get(cid_int),
+                        curr_short_ids, held_short_drifted_w[cid_int]
+                    )
                     flat_country_cost[cid_int] = (lt + st) * tc_bps / 10000.0
-                    prev_long_ids[cid_int] = held_long_ids[cid_int]
-                    prev_short_ids[cid_int] = held_short_ids[cid_int]
                 else:
                     held_top_ids[cid_int] = firm_ids[idxs]
-                    t_ = _firm_id_turnover(prev_top_ids.get(cid_int), held_top_ids[cid_int])
+                    top_w_c = _capped_softmax_weights(scores_c, config.max_position_weight)
+                    held_top_drifted_w[cid_int] = (top_w_c.detach().cpu().numpy().astype(np.float64))
+                    curr_top_ids = [int(firm_ids[p].item()) for p in idxs]
+                    t_ = _weight_l1_turnover(
+                        prev_drifted_top_ids.get(cid_int),
+                        prev_drifted_top_w.get(cid_int),
+                        curr_top_ids, held_top_drifted_w[cid_int],
+                    )
                     flat_country_cost[cid_int] = t_ * tc_bps / 10000.0
-                    prev_top_ids[cid_int] = held_top_ids[cid_int]
 
             if len(raw_monthly_hist) >= n_vol_periods:
                 recent = np.array(raw_monthly_hist[-n_vol_periods:])
-                realised_vol = recent.std() * np.sqrt(periods_per_year)
+                realised_vol = recent.std(ddof=1) * np.sqrt(periods_per_year)
                 lev = config.target_vol / max(realised_vol, 1e-6)
                 current_leverage = float(np.clip(
                     lev, 1.0 / leverage_bound, leverage_bound,
@@ -1487,6 +1670,24 @@ def portfolio_simulation_country_composite_monthly(models, dataset, config,
         active_country_ids = (
             list(held_long_ids.keys()) if long_short else list(held_top_ids.keys())
         )
+
+        def _step_country_leg(held_ids_tensor, drifted_w):
+            """Same buy-and-hold drift logic as the global long-short
+            monthly simulator, applied here to the within-country leg."""
+            n_held = len(drifted_w)
+            r_array = np.zeros(n_held, dtype=np.float64)
+            for j in range(n_held):
+                held_id = int(held_ids_tensor[j].item())
+                if held_id in current_id_to_idx:
+                    cp = current_id_to_idx[held_id]
+                    if valid[cp]:
+                        r_array[j] = float(raw_returns[cp].item())
+            leg_ret = float((drifted_w * r_array).sum())
+            growth = drifted_w * (1.0 + r_array)
+            g_sum = float(growth.sum())
+            new_drifted_w = growth / g_sum if g_sum > 1e-12 else drifted_w
+            return leg_ret, new_drifted_w
+
         for cid_int in active_country_ids:
             # current-month firms in this country, for market cap weighting
             country_mask = country_ids_np == cid_int
@@ -1499,44 +1700,18 @@ def portfolio_simulation_country_composite_monthly(models, dataset, config,
             country_market_caps[cid_int] = cap
 
             if long_short:
-                long_ids_c = held_long_ids[cid_int]
-                short_ids_c = held_short_ids[cid_int]
-                n_long_c = len(long_ids_c)
-                n_short_c = len(short_ids_c)
-
-                long_r = 0.0
-                long_cnt = 0
-                for hi in range(n_long_c):
-                    held_id = int(long_ids_c[hi].item())
-                    if held_id in current_id_to_idx:
-                        cp = current_id_to_idx[held_id]
-                        if valid[cp]:
-                            long_r += float(raw_returns[cp].item())
-                            long_cnt += 1
-                short_r = 0.0
-                short_cnt = 0
-                for hi in range(n_short_c):
-                    held_id = int(short_ids_c[hi].item())
-                    if held_id in current_id_to_idx:
-                        cp = current_id_to_idx[held_id]
-                        if valid[cp]:
-                            short_r += float(raw_returns[cp].item())
-                            short_cnt += 1
-                long_ret_c = long_r / max(long_cnt, 1) if long_cnt > 0 else 0.0
-                short_ret_c = short_r / max(short_cnt, 1) if short_cnt > 0 else 0.0
+                long_ret_c, held_long_drifted_w[cid_int] = _step_country_leg(
+                    held_long_ids[cid_int], held_long_drifted_w[cid_int],
+                )
+                short_ret_c, held_short_drifted_w[cid_int] = _step_country_leg(
+                    held_short_ids[cid_int], held_short_drifted_w[cid_int],
+                )
                 country_returns[cid_int] = long_ret_c - short_ret_c
             else:
-                top_ids_c = held_top_ids[cid_int]
-                top_r = 0.0
-                top_cnt = 0
-                for hi in range(len(top_ids_c)):
-                    held_id = int(top_ids_c[hi].item())
-                    if held_id in current_id_to_idx:
-                        cp = current_id_to_idx[held_id]
-                        if valid[cp]:
-                            top_r += float(raw_returns[cp].item())
-                            top_cnt += 1
-                country_returns[cid_int] = top_r / max(top_cnt, 1) if top_cnt > 0 else 0.0
+                top_ret_c, held_top_drifted_w[cid_int] = _step_country_leg(
+                    held_top_ids[cid_int], held_top_drifted_w[cid_int],
+                )
+                country_returns[cid_int] = top_ret_c
 
         if not country_returns:
             monthly_scaled.append(0.0)
@@ -1578,7 +1753,7 @@ def compute_portfolio_metrics(returns, periods_per_year=2):
     annualised_return = (
         (1 + cum_return) ** (periods_per_year / max(len(returns), 1)) - 1
     )
-    annualised_vol = returns.std() * np.sqrt(periods_per_year)
+    annualised_vol = returns.std(ddof=1) * np.sqrt(periods_per_year)
     # sharpe uses the arithmetic mean, not the CAGR. the geometric mean is
     # always below the arithmetic mean by approximately variance/2 (Jensen),
     # so using CAGR would systematically overstate the Sharpe ratio.
@@ -1596,36 +1771,35 @@ def compute_portfolio_metrics(returns, periods_per_year=2):
     }
 
 
-def rolling_sharpe(returns, window_periods, periods_per_year=2):
-    returns = np.asarray(returns, dtype=float)
-    series = []
-    for start in range(0, len(returns) - window_periods + 1):
-        window = returns[start:start + window_periods]
-        ann_ret = window.mean() * periods_per_year
-        ann_vol = window.std() * np.sqrt(periods_per_year)
-        series.append(float(ann_ret / max(ann_vol, 1e-8)))
-    if not series:
-        return {"series": [], "mean": None, "std": None}
-    return {
-        "series": series,
-        "mean": float(np.mean(series)),
-        "std": float(np.std(series, ddof=1)) if len(series) > 1 else 0.0,
-    }
-
-
-def compute_portfolio_metrics_extended(returns, periods_per_year=2):
-    base = compute_portfolio_metrics(returns, periods_per_year)
-    window_3y = int(round(3 * periods_per_year))
-    window_5y = int(round(5 * periods_per_year))
+def compute_portfolio_metrics_extended(returns, periods_per_year: float = 2, dates=None):
+    base = compute_portfolio_metrics(returns, int(periods_per_year))
     returns_arr = np.asarray(returns, dtype=float)
-    base["rolling_sharpe_3y"] = rolling_sharpe(returns_arr, window_3y, periods_per_year)
-    if len(returns_arr) >= window_5y:
-        head = returns_arr[:window_5y]
-        ann_ret = head.mean() * periods_per_year
-        ann_vol = head.std() * np.sqrt(periods_per_year)
-        base["sharpe_5y"] = float(ann_ret / max(ann_vol, 1e-8))
-    else:
-        base["sharpe_5y"] = None
+    if dates is not None and len(returns_arr) > 0:
+        years = pd.DatetimeIndex(dates).year.to_numpy()
+        per_year = {}
+        for y in sorted(set(years.tolist())):
+            mask = years == y
+            sub = returns_arr[mask]
+            if len(sub) < 1:
+                continue
+            y_ret = float(sub.mean() * periods_per_year)
+            y_vol = (
+                float(sub.std(ddof=1) * np.sqrt(periods_per_year))
+                if len(sub) > 1 else 0.0
+            )
+            y_sharpe = (
+                y_ret / max(y_vol, 1e-8)
+                if y_vol > 1e-12 else float('nan')
+            )
+            ycw = np.cumprod(1.0 + sub)
+            ypk = np.maximum.accumulate(ycw)
+            y_dd = float(((ypk - ycw) / ypk).max())
+            per_year[int(y)] = {
+                "ann_ret": y_ret, "ann_vol": y_vol,
+                "sharpe": y_sharpe, "max_dd": y_dd,
+                "cum_return": float(ycw[-1] - 1.0), "n_obs": int(len(sub))
+            }
+        base["per_year"] = per_year
     return base
 
 
@@ -1653,14 +1827,17 @@ def _jsonable_metrics(metrics_dict):
     return _to_native(metrics_dict)
 
 
-def _build_per_country_block(per_country_dict, country_codes_list,
-                              country_to_id_map, periods_per_year=2):
+def _build_per_country_block(per_country_dict, country_codes_list, country_to_id_map, periods_per_year=2, dates=None):
     id_to_code = {v: k for k, v in country_to_id_map.items()}
     out = {}
     for cid_int, entry in per_country_dict.items():
         country_code = id_to_code.get(cid_int, f"id_{cid_int}")
         returns_arr = np.array(entry["returns"], dtype=float)
         weights_arr = np.array(entry["weights"], dtype=float)
+        # the per country block aggregates returns observed only on the
+        # rebalances where the country cleared min_firms_country, so its
+        # observation count and date alignment do not match the test
+        # window in general; per_year is left unattached here.
         base = compute_portfolio_metrics_extended(returns_arr, periods_per_year)
         contributions = weights_arr * returns_arr
         time_avg_contrib = (
@@ -1678,8 +1855,6 @@ def _build_per_country_block(per_country_dict, country_codes_list,
             "sharpe_ratio": base["sharpe_ratio"],
             "max_drawdown": base["max_drawdown"],
             "cumulative_return": base["cumulative_return"],
-            "rolling_sharpe_3y": base["rolling_sharpe_3y"],
-            "sharpe_5y": base["sharpe_5y"],
             "time_average_contribution": time_avg_contrib,
             "cumulative_contribution": cum_contrib,
         }
@@ -1689,14 +1864,38 @@ def _build_per_country_block(per_country_dict, country_codes_list,
 # Evaluation
 
 all_results = {}
-for metrics_path in sorted(cfg.results_dir.glob("metrics_*.json")):
+variant_seed_paths = {}
+seed_pattern = re.compile(r"^metrics_(?P<variant>.+)_seed(?P<seed>\d+)\.json$")
+for metrics_path in sorted(cfg.results_dir.glob("metrics_*_seed*.json")):
+    m = seed_pattern.match(metrics_path.name)
+    if not m:
+        continue
+    variant_name = m.group("variant")
+    seed_idx = int(m.group("seed"))
     with open(metrics_path, "r") as f:
         metrics = json.load(f)
-    variant_name = metrics.get("variant") or metrics_path.stem.replace("metrics_", "")
-    all_results[variant_name] = metrics
+    # The variant-level all_results entry is keyed by variant name and
+    # holds the first encountered seed's metrics for backward compatible
+    # reading of architecture and config. Per-seed records are stored
+    # under the per_seed_metrics list.
+    if variant_name not in all_results:
+        all_results[variant_name] = metrics
+        all_results[variant_name]["per_seed_metrics"] = []
+    all_results[variant_name]["per_seed_metrics"].append({
+        "seed_idx": seed_idx, "metrics_path": str(metrics_path), "metrics": metrics,
+    })
+    variant_seed_paths.setdefault(variant_name, []).append(
+        (seed_idx, cfg.results_dir / f"weights_{variant_name}_seed{seed_idx}.safetensors")
+    )
 
 if not all_results:
-    raise RuntimeError(f"No metrics files found in {cfg.results_dir}")
+    raise RuntimeError(
+        f"No seeded metrics files found in {cfg.results_dir}. "
+        f"Expected files of the form metrics_{{variant}}_seed{{i}}.json."
+    )
+
+for variant_name in variant_seed_paths:
+    variant_seed_paths[variant_name].sort(key=lambda x: x[0])
 
 test_ds = load_dataset(
     cfg.test_path, k0_feature_cols, k1_feature_cols,
@@ -1707,10 +1906,11 @@ val_ds = load_dataset(
     k0_miss_cols, k1_miss_cols, target_cols, country_lookup_df,
 )
 
+# Single horizon evaluation. The 3m and 12m horizons no longer exist
+# on the trained model under the MSRR objective, so the iteration
+# collapses to a single 6m entry.
 horizons = [
-    ("scores_3m", "target_3m", "3m", 3),
     ("scores_6m", "target_6m", "6m", 6),
-    ("scores_12m", "target_12m", "12m", 12),
 ]
 
 variant_test_summary = {}
@@ -1724,37 +1924,59 @@ for variant_name in all_results:
     # variant's checkpoint was saved. each variant may have a different
     # n_layers, d_model, d_ff, or encoder-specific field from its own
     # optuna study, and instantiating DualPathTransformer(cfg) with stale
-    # values causes a state_dict mismatch on blocks.1.* etc.
+    # values causes a state_dict mismatch on blocks.1.* etc. min_firms_attention
+    # does not cause a state_dict mismatch since it is a runtime threshold
+    # rather than a parameter shape, which is why its omission previously
+    # went unnoticed: eval's own default of 10 silently overrode the 30 used
+    # in training, so Path 2 ran at evaluation time for 10 to 29 firm country
+    # buckets the adjustment head was never exposed to during training.
     stored_cfg = all_results[variant_name].get("config", {})
     for field in (
         "d_model", "n_heads", "n_layers", "d_ff", "dropout",
         "top_k_attention", "n_mlp_layers", "periodic_num_freq", "ple_num_bins",
+        "min_firms_attention",
     ):
         if field in stored_cfg:
             setattr(cfg, field, stored_cfg[field])
 
-    variant_model = DualPathTransformer(cfg).to(device)
-    weights_path = cfg.results_dir / f"weights_{variant_name}.safetensors"
-    variant_model.load_state_dict(safetensors_load(str(weights_path)))
-    variant_models[variant_name] = variant_model
+    variant_model_list = []
+    for seed_idx, weights_path in variant_seed_paths[variant_name]:
+        m = DualPathTransformer(cfg).to(device)
+        m.load_state_dict(safetensors_load(str(weights_path)))
+        m.eval()
+        variant_model_list.append(m)
+    variant_models[variant_name] = variant_model_list
+    # The portfolio simulation functions already accept a list of models
+    # and average their scores via _ensemble_score. We pass the full list
+    # at every simulation call below to take advantage of cross-seed
+    # variance reduction.
+    variant_model = variant_model_list
 
-    # validation simulation used for variant selection. no seed is needed
-    # here because the validation set runs the full vol overlay from its own
-    # history; the leverage will simply be 1.0 until vol_lookback_months of
-    # observations accumulate, which is the intended cold-start behaviour.
-    val_periods_per_year = 12 / cfg.rebalance_freq
-    val_ls_scaled, val_ls_unscaled = portfolio_simulation_long_short(
-        variant_model, val_ds, cfg,
-        rebalance_freq=cfg.rebalance_freq, tc_bps=cfg.tc_bps,
+    # validation simulation used for variant selection. run at the same
+    # rebalance cadence as the test simulation so the val Sharpe is on the
+    # same scale and directly comparable to the test Sharpe. using
+    # cfg.rebalance_freq (3, quarterly) here would compute val Sharpe with
+    # periods_per_year=4 instead of 2, making the selection criterion
+    # inconsistent with what the test simulation reports.
+    val_rebal_freq = 6
+    val_periods_per_year = 12 / val_rebal_freq
+    val_ls_scaled, val_ls_unscaled = portfolio_simulation_long_short(variant_model, val_ds, cfg,
+        rebalance_freq=val_rebal_freq, tc_bps=cfg.tc_bps,
     )
     val_ls_metrics = compute_portfolio_metrics_extended(
         val_ls_scaled, val_periods_per_year
     )
+    # Cross-seed average of the per-seed best validation rank correlation.
+    per_seed_corrs = []
+    for seed_record in all_results[variant_name].get("per_seed_metrics", []):
+        c = seed_record["metrics"].get("val_metrics", {}).get("rank_corr_6m")
+        if isinstance(c, (int, float)):
+            per_seed_corrs.append(c)
+    val_rank_corr = (
+        float(np.mean(per_seed_corrs)) if per_seed_corrs else float("nan")
+    )
     variant_val_summary[variant_name] = {
-        "rank_corr_6m": all_results[variant_name]
-            .get("val_metrics", {})
-            .get("rank_corr", {})
-            .get("target_6m", float("nan")),
+        "rank_corr_6m": val_rank_corr,
         "sharpe_ls": val_ls_metrics["sharpe_ratio"],
     }
 
@@ -1853,10 +2075,27 @@ for variant_name in all_results:
         mo_cc_ls_returns = np.array([])
         mo_cc_ls_unscaled = np.array([])
         if horizon_label == "6m":
+            mo_lo_seed = _seed_vol_history_monthly(
+                variant_model, val_ds, cfg, rebal_freq, "long_only",
+                score_key=score_key,
+            )
+            mo_ls_seed = _seed_vol_history_monthly(
+                variant_model, val_ds, cfg, rebal_freq, "long_short",
+                score_key=score_key,
+            )
+            mo_cc_lo_seed = _seed_vol_history_monthly(
+                variant_model, val_ds, cfg, rebal_freq, "country_long_only",
+                score_key=score_key,
+            )
+            mo_cc_ls_seed = _seed_vol_history_monthly(
+                variant_model, val_ds, cfg, rebal_freq, "country_long_short",
+                score_key=score_key,
+            )
+
             mo_lo_result = portfolio_simulation_monthly(
                 variant_model, test_ds, cfg,
                 rebalance_freq=rebal_freq, tc_bps=cfg.tc_bps,
-                seed_returns=None,
+                seed_returns=mo_lo_seed,
                 record_holdings=False, score_key=score_key,
             )
             mo_lo_returns, mo_lo_unscaled = mo_lo_result[0], mo_lo_result[1]
@@ -1864,7 +2103,7 @@ for variant_name in all_results:
             mo_ls_result = portfolio_simulation_long_short_monthly(
                 variant_model, test_ds, cfg,
                 rebalance_freq=rebal_freq, tc_bps=cfg.tc_bps,
-                seed_returns=None,
+                seed_returns=mo_ls_seed,
                 record_holdings=False, score_key=score_key,
             )
             mo_ls_returns, mo_ls_unscaled = mo_ls_result[0], mo_ls_result[1]
@@ -1872,7 +2111,7 @@ for variant_name in all_results:
             mo_cc_lo_result = portfolio_simulation_country_composite_monthly(
                 variant_model, test_ds, cfg,
                 rebalance_freq=rebal_freq, tc_bps=cfg.tc_bps,
-                long_short=False, seed_returns=None,
+                long_short=False, seed_returns=mo_cc_lo_seed,
                 record_holdings=False, score_key=score_key,
             )
             mo_cc_lo_returns, mo_cc_lo_unscaled = (
@@ -1882,81 +2121,63 @@ for variant_name in all_results:
             mo_cc_ls_result = portfolio_simulation_country_composite_monthly(
                 variant_model, test_ds, cfg,
                 rebalance_freq=rebal_freq, tc_bps=cfg.tc_bps,
-                long_short=True, seed_returns=None,
+                long_short=True, seed_returns=mo_cc_ls_seed,
                 record_holdings=False, score_key=score_key,
             )
             mo_cc_ls_returns, mo_cc_ls_unscaled = (
                 mo_cc_ls_result[0], mo_cc_ls_result[1]
             )
 
+        # End-of-month timestamp lists for the test window, used by the
+        # per_year and per_month aggregation downstream. The rebalance
+        # date list contains one entry per rebalance period, six months
+        # apart, matching the length of lo_returns and ls_returns. The
+        # monthly date list contains one entry per calendar month,
+        # matching the length of mo_lo_returns and mo_ls_returns.
+        all_test_dates = [
+            test_ds.monthly_data[i]["eom"] for i in range(len(test_ds))
+        ]
+        rebal_dates = all_test_dates[::rebal_freq]
+        monthly_dates = all_test_dates
+
         block = {
-            "long_only": compute_portfolio_metrics_extended(
-                lo_returns, periods_per_year
-            ),
-            "long_only_unscaled": compute_portfolio_metrics_extended(
-                lo_unscaled, periods_per_year
-            ),
-            "long_short": compute_portfolio_metrics_extended(
-                ls_returns, periods_per_year
-            ),
-            "long_short_unscaled": compute_portfolio_metrics_extended(
-                ls_unscaled, periods_per_year
-            ),
-            "country_composite_long_only": compute_portfolio_metrics_extended(
-                cc_lo_returns, periods_per_year
-            ),
-            "country_composite_long_only_unscaled": compute_portfolio_metrics_extended(
-                cc_lo_unscaled, periods_per_year
-            ),
-            "country_composite_long_short": compute_portfolio_metrics_extended(
-                cc_ls_returns, periods_per_year
-            ),
-            "country_composite_long_short_unscaled": compute_portfolio_metrics_extended(
-                cc_ls_unscaled, periods_per_year
-            ),
+            "long_only": compute_portfolio_metrics_extended(lo_returns, int(periods_per_year), dates=rebal_dates),
+            "long_only_unscaled": compute_portfolio_metrics_extended(lo_unscaled, int(periods_per_year), dates=rebal_dates),
+            "long_short": compute_portfolio_metrics_extended(ls_returns, int(periods_per_year), dates=rebal_dates),
+            "long_short_unscaled": compute_portfolio_metrics_extended(ls_unscaled, int(periods_per_year), dates=rebal_dates),
+            "country_composite_long_only": compute_portfolio_metrics_extended(cc_lo_returns, int(periods_per_year), dates=rebal_dates),
+            "country_composite_long_only_unscaled": compute_portfolio_metrics_extended(cc_lo_unscaled, int(periods_per_year), dates=rebal_dates),
+            "country_composite_long_short": compute_portfolio_metrics_extended(cc_ls_returns, int(periods_per_year), dates=rebal_dates),
+            "country_composite_long_short_unscaled": compute_portfolio_metrics_extended(cc_ls_unscaled, int(periods_per_year), dates=rebal_dates)
         }
         # for the 6m horizon, attach the monthly-frequency metrics so the
         # Sharpe ratio is directly comparable to the FF5 benchmark which
         # reports 60 monthly observations on the same test window.
         if horizon_label == "6m":
-            block["long_only_monthly"] = compute_portfolio_metrics_extended(
-                mo_lo_returns, 12.0
-            )
-            block["long_only_monthly_unscaled"] = compute_portfolio_metrics_extended(
-                mo_lo_unscaled, 12.0
-            )
-            block["long_short_monthly"] = compute_portfolio_metrics_extended(
-                mo_ls_returns, 12.0
-            )
-            block["long_short_monthly_unscaled"] = compute_portfolio_metrics_extended(
-                mo_ls_unscaled, 12.0
-            )
+            block["long_only_monthly"] = compute_portfolio_metrics_extended(mo_lo_returns, 12.0, dates=monthly_dates)
+            block["long_only_monthly_unscaled"] = compute_portfolio_metrics_extended(mo_lo_unscaled, 12.0, dates=monthly_dates)
+            block["long_short_monthly"] = compute_portfolio_metrics_extended(mo_ls_returns, 12.0, dates=monthly_dates)
+            block["long_short_monthly_unscaled"] = compute_portfolio_metrics_extended(mo_ls_unscaled, 12.0, dates=monthly_dates)
             block["country_composite_long_only_monthly"] = (
-                compute_portfolio_metrics_extended(mo_cc_lo_returns, 12.0)
+                compute_portfolio_metrics_extended(mo_cc_lo_returns, 12.0, dates=monthly_dates)
             )
             block["country_composite_long_only_monthly_unscaled"] = (
-                compute_portfolio_metrics_extended(mo_cc_lo_unscaled, 12.0)
+                compute_portfolio_metrics_extended(mo_cc_lo_unscaled, 12.0, dates=monthly_dates)
             )
             block["country_composite_long_short_monthly"] = (
-                compute_portfolio_metrics_extended(mo_cc_ls_returns, 12.0)
+                compute_portfolio_metrics_extended(mo_cc_ls_returns, 12.0, dates=monthly_dates)
             )
             block["country_composite_long_short_monthly_unscaled"] = (
-                compute_portfolio_metrics_extended(mo_cc_ls_unscaled, 12.0)
+                compute_portfolio_metrics_extended(mo_cc_ls_unscaled, 12.0, dates=monthly_dates)
             )
         portfolio_block[horizon_label] = block
 
         if horizon_label == "6m":
             per_country_blocks["country_composite_long_only"] = (
-                _build_per_country_block(
-                    cc_lo_per_country, country_codes,
-                    col_meta["country_to_id"], periods_per_year,
-                )
+                _build_per_country_block(cc_lo_per_country, country_codes,col_meta["country_to_id"], int(periods_per_year))
             )
             per_country_blocks["country_composite_long_short"] = (
-                _build_per_country_block(
-                    cc_ls_per_country, country_codes,
-                    col_meta["country_to_id"], periods_per_year,
-                )
+                _build_per_country_block(cc_ls_per_country, country_codes,col_meta["country_to_id"], int(periods_per_year))
             )
             holdings_records.extend(lo_holdings)
             holdings_records.extend(ls_holdings)
@@ -1967,9 +2188,18 @@ for variant_name in all_results:
             leverage_records.extend(cc_lo_leverage)
             leverage_records.extend(cc_ls_leverage)
 
+    # Cross-seed average of the per-seed test rank correlation.
+    per_seed_test_corrs = []
+    for seed_record in all_results[variant_name].get("per_seed_metrics", []):
+        c = seed_record["metrics"].get("test_metrics", {}).get("rank_corr_6m")
+        if isinstance(c, (int, float)):
+            per_seed_test_corrs.append(c)
+    test_rank_corr = (
+        float(np.mean(per_seed_test_corrs)) if per_seed_test_corrs else float("nan")
+    )
+
     variant_test_summary[variant_name] = {
-        "corr_6m": all_results[variant_name]["test_metrics"]
-            .get("rank_corr", {}).get("target_6m", float("nan")),
+        "corr_6m": test_rank_corr,
         "sharpe_lo": portfolio_block["6m"]["long_only"]["sharpe_ratio"],
         "sharpe_lo_unscaled": portfolio_block["6m"]["long_only_unscaled"]["sharpe_ratio"],
         "sharpe_ls": portfolio_block["6m"]["long_short"]["sharpe_ratio"],
@@ -1983,56 +2213,142 @@ for variant_name in all_results:
         "sharpe_ls_monthly_u": portfolio_block["6m"]["long_short_monthly_unscaled"]["sharpe_ratio"],
     }
 
+    # Persist the ensembled portfolio metrics under a variant-level
+    # metrics file. The per-seed metrics files remain unchanged on disk.
     variant_metrics_path = cfg.results_dir / f"metrics_{variant_name}.json"
-    with open(variant_metrics_path, "r") as f:
-        saved_metrics = json.load(f)
+    saved_metrics = dict(all_results[variant_name])
+    saved_metrics.pop("per_seed_metrics", None)
     saved_metrics["portfolio_metrics"] = _jsonable_metrics(portfolio_block["6m"])
     saved_metrics["per_horizon_portfolio_metrics"] = _jsonable_metrics(portfolio_block)
     saved_metrics["per_country"] = _jsonable_metrics(per_country_blocks)
     saved_metrics["validation_portfolio_metrics"] = _jsonable_metrics({
         "long_short": val_ls_metrics,
     })
+    saved_metrics["ensemble_seed_count"] = len(variant_model_list)
+    saved_metrics["ensemble_test_rank_corr_6m"] = test_rank_corr
+    saved_metrics["ensemble_val_rank_corr_6m"] = val_rank_corr
     with open(variant_metrics_path, "w") as f:
         json.dump(saved_metrics, f, indent=2)
+
+    # per year metrics CSV. one row per (strategy, scaling, year), based
+    # on the per_year sub block attached to every entry in the 6m
+    # portfolio_block. the same construction is applied to the 6m
+    # rebalance simulations (n_obs equals two per year) and the monthly
+    # simulations (n_obs equals twelve per year). for plot construction,
+    # the monthly rows are more reliable since each year carries twelve
+    # observations.
+    per_year_rows = []
+    block_6m = portfolio_block["6m"]
+    for strategy_key, metrics_dict in block_6m.items():
+        if not isinstance(metrics_dict, dict):
+            continue
+        py = metrics_dict.get("per_year", {})
+        scaling = "unscaled" if strategy_key.endswith("_unscaled") else "scaled"
+        strategy = (
+            strategy_key[:-len("_unscaled")] if strategy_key.endswith("_unscaled")
+            else strategy_key
+        )
+        for year, ym in sorted(py.items()):
+            per_year_rows.append({
+                "variant": variant_name,
+                "strategy": strategy,
+                "scaling": scaling,
+                "year": int(year),
+                "ann_ret": round(float(ym["ann_ret"]) * 100, 4),
+                "ann_vol": round(float(ym["ann_vol"]) * 100, 4),
+                "sharpe": (
+                    None if np.isnan(ym["sharpe"]) else round(float(ym["sharpe"]), 4)
+                ),
+                "max_dd": round(float(ym["max_dd"]) * 100, 4),
+                "cum_return": round(float(ym["cum_return"]) * 100, 4),
+                "n_obs": int(ym["n_obs"]),
+            })
+    per_year_df = pd.DataFrame(per_year_rows)
+    per_year_path = cfg.results_dir / f"per_year_{variant_name}.csv"
+    per_year_df.to_csv(per_year_path, index=False)
+    print(f"Per year metrics  {per_year_path}  ({len(per_year_df):,} rows)")
+
+    # per month metrics CSV, one row per (strategy, scaling, month). Carries
+    # the running cumulative wealth, the running drawdown, and the
+    # trailing twelve month Sharpe and annualised return. Source data is
+    # the four monthly simulation series produced under the 6m horizon,
+    # namely long only, long short, country composite long only, and
+    # country composite long short, each under unscaled and scaled.
+
+    def _build_monthly_rows(strategy, scaling, rets, dates):
+        rets = np.asarray(rets, dtype=np.float64)
+        if len(rets) == 0:
+            return []
+        cum_wealth = np.cumprod(1.0 + rets)
+        peak = np.maximum.accumulate(cum_wealth)
+        drawdown = (cum_wealth - peak) / peak
+        rolling_sharpe = np.full(len(rets), np.nan)
+        rolling_ret = np.full(len(rets), np.nan)
+        for i in range(11, len(rets)):
+            w = rets[i - 11:i + 1]
+            mu = float(w.mean() * 12.0)
+            sigma = float(w.std(ddof=1) * np.sqrt(12.0))
+            rolling_ret[i] = mu
+            if sigma > 1e-12:
+                rolling_sharpe[i] = mu / sigma
+        rows = []
+        for i, eom in enumerate(dates):
+            rows.append({
+                "variant": variant_name,
+                "strategy": strategy,
+                "scaling": scaling,
+                "eom": pd.Timestamp(eom).strftime("%Y-%m-%d"),
+                "return": round(float(rets[i]), 6),
+                "cumulative_wealth": round(float(cum_wealth[i]), 6),
+                "drawdown": round(float(drawdown[i]), 6),
+                "rolling_sharpe_12m": (
+                    None if np.isnan(rolling_sharpe[i])
+                    else round(float(rolling_sharpe[i]), 4)
+                ),
+                "rolling_return_12m": (
+                    None if np.isnan(rolling_ret[i])
+                    else round(float(rolling_ret[i]) * 100, 4)
+                ),
+            })
+        return rows
+
+    monthly_rows = []
+    monthly_rows.extend(_build_monthly_rows("long_only", "unscaled", mo_lo_unscaled, monthly_dates))
+    monthly_rows.extend(_build_monthly_rows("long_only", "scaled", mo_lo_returns, monthly_dates))
+    monthly_rows.extend(_build_monthly_rows("long_short", "unscaled", mo_ls_unscaled, monthly_dates))
+    monthly_rows.extend(_build_monthly_rows("long_short", "scaled", mo_ls_returns, monthly_dates))
+    monthly_rows.extend(_build_monthly_rows("country_composite_long_only", "unscaled",mo_cc_lo_unscaled, monthly_dates))
+    monthly_rows.extend(_build_monthly_rows("country_composite_long_only", "scaled",mo_cc_lo_returns, monthly_dates))
+    monthly_rows.extend(_build_monthly_rows("country_composite_long_short", "unscaled",mo_cc_ls_unscaled, monthly_dates))
+    monthly_rows.extend(_build_monthly_rows("country_composite_long_short", "scaled",mo_cc_ls_returns, monthly_dates))
+    per_month_df = pd.DataFrame(monthly_rows)
+    per_month_path = cfg.results_dir / f"per_month_{variant_name}.csv"
+    per_month_df.to_csv(per_month_path, index=False)
+    print(f"Per month metrics {per_month_path}  ({len(per_month_df):,} rows)")
 
     if holdings_records:
         holdings_df = pd.DataFrame(holdings_records)
         holdings_path = cfg.results_dir / f"holdings_{variant_name}.parquet"
         holdings_df.to_parquet(holdings_path, index=False)
-        print(f"Holdings  {holdings_path}  ({len(holdings_df):,} rows)")
+        print(f"Holdings  {holdings_path} ({len(holdings_df):,} rows)")
 
     if leverage_records:
         leverage_df = pd.DataFrame(leverage_records)
         leverage_path = cfg.results_dir / f"leverage_{variant_name}.parquet"
         leverage_df.to_parquet(leverage_path, index=False)
-        print(f"Leverage  {leverage_path}  ({len(leverage_df):,} rows)")
+        print(f"Leverage  {leverage_path} ({len(leverage_df):,} rows)")
 
     print(f"Metrics updated  {variant_metrics_path}")
 
 
 # Variant selection on validation set metrics
 
-best_variant = max(
-    variant_val_summary,
-    key=lambda v: variant_val_summary[v]["rank_corr_6m"],
-)
-best_sharpe_variant = max(
-    variant_val_summary,
-    key=lambda v: variant_val_summary[v]["sharpe_ls"],
-)
+best_variant = max(variant_val_summary, key=lambda v: variant_val_summary[v]["rank_corr_6m"])
+best_sharpe_variant = max(variant_val_summary, key=lambda v: variant_val_summary[v]["sharpe_ls"])
 
-print()
 print("Variant comparison (test set columns are reported; validation set")
-print("columns are the selection criteria):")
-print("Scaled = volatility-targeted with leverage overlay.")
-print("Unscaled = flat position sizing, no leverage.")
-print()
-hdr = (
-    f"{'variant':<14} {'val_corr':>8}  {'val_sr_ls':>9}  "
-    f"{'corr_6m':>8}  "
-    f"{'sr_lo':>7}  {'sr_lo_u':>7}  "
-    f"{'sr_ls':>7}  {'sr_ls_u':>7}  "
-    f"{'vol_ls':>7}  {'vol_ls_u':>8}"
+hdr = (f"{'variant':<14}{'val_corr':>8}{'val_sr_ls':>9}{'corr_6m':>8}{'sr_lo':>7}{'sr_lo_u':>7}{'sr_ls':>7}{'sr_ls_u':>7}"
+    f"{'vol_ls':>7}{'vol_ls_u':>8}"
 )
 print(hdr)
 for variant_name in all_results:
@@ -2043,13 +2359,9 @@ for variant_name in all_results:
         marker += "  *corr"
     if variant_name == best_sharpe_variant:
         marker += "  *sharpe"
-    print(
-        f"{variant_name:<14} "
-        f"{vs['rank_corr_6m']:>8.4f}  {vs['sharpe_ls']:>9.4f}  "
-        f"{ts['corr_6m']:>8.4f}  "
-        f"{ts['sharpe_lo']:>7.4f}  {ts['sharpe_lo_unscaled']:>7.4f}  "
-        f"{ts['sharpe_ls']:>7.4f}  {ts['sharpe_ls_unscaled']:>7.4f}  "
-        f"{ts['vol_ls']:>7.4f}  {ts['vol_ls_unscaled']:>8.4f}{marker}"
+    print(f"{variant_name:<14}{vs['rank_corr_6m']:>8.4f}{vs['sharpe_ls']:>9.4f}"
+        f"{ts['corr_6m']:>8.4f}{ts['sharpe_lo']:>7.4f}{ts['sharpe_lo_unscaled']:>7.4f}  "
+        f"{ts['sharpe_ls']:>7.4f}{ts['sharpe_ls_unscaled']:>7.4f}{ts['vol_ls']:>7.4f}{ts['vol_ls_unscaled']:>8.4f}{marker}"
     )
 print(f"Best by validation rank correlation, {best_variant}")
 print(f"Best by validation long short Sharpe ratio, {best_sharpe_variant}")
@@ -2057,33 +2369,18 @@ print(f"Best by validation long short Sharpe ratio, {best_sharpe_variant}")
 # Monthly-frequency Sharpe ratios (60 monthly observations; directly
 # comparable to the FF5 benchmark which uses monthly returns under a
 # periodic rebalance).
-print()
 print("Monthly-frequency Sharpe ratios (6m rebalance, target_1m monthly returns):")
-hdr_mo = (
-    f"{'variant':<14} "
-    f"{'sr_lo_mo':>9}  {'sr_lo_mo_u':>11}  "
-    f"{'sr_ls_mo':>9}  {'sr_ls_mo_u':>11}"
-)
+hdr_mo = (f"{'variant':<14}{'sr_lo_mo':>9}{'sr_lo_mo_u':>11}{'sr_ls_mo':>9}{'sr_ls_mo_u':>11}")
 print(hdr_mo)
 for variant_name in all_results:
     ts = variant_test_summary[variant_name]
-    print(
-        f"{variant_name:<14} "
-        f"{ts['sharpe_lo_monthly']:>9.4f}  {ts['sharpe_lo_monthly_u']:>11.4f}  "
-        f"{ts['sharpe_ls_monthly']:>9.4f}  {ts['sharpe_ls_monthly_u']:>11.4f}"
+    print(f"{variant_name:<14}{ts['sharpe_lo_monthly']:>9.4f}{ts['sharpe_lo_monthly_u']:>11.4f}"
+        f"{ts['sharpe_ls_monthly']:>9.4f}{ts['sharpe_ls_monthly_u']:>11.4f}"
     )
 
-# Detailed test set report for best_variant
+# Detailed test set report, all variants
 
-best_metrics_path = cfg.results_dir / f"metrics_{best_variant}.json"
-with open(best_metrics_path, "r") as f:
-    best_saved_metrics = json.load(f)
-six_month_metrics = best_saved_metrics["portfolio_metrics"]
-
-print(f"Detailed test set portfolio metrics for {best_variant} (best by validation rank correlation):")
-print("(scaled) = with volatility overlay leverage.  (unscaled) = no leverage, flat tc.")
-print()
-_report_labels = [
+report_labels = [
     ("long_only", "long_only_unscaled"),
     ("long_short", "long_short_unscaled"),
     ("country_composite_long_only", "country_composite_long_only_unscaled"),
@@ -2095,37 +2392,63 @@ _report_labels = [
     ("country_composite_long_short_monthly",
      "country_composite_long_short_monthly_unscaled"),
 ]
-for label, label_u in _report_labels:
-    print(f"{label}:")
-    m = six_month_metrics[label]
-    mu = six_month_metrics[label_u]
-    for k in ("cumulative_return", "annualised_return", "annualised_vol",
-              "sharpe_ratio", "max_drawdown", "n_rebalances", "sharpe_5y"):
-        v = m.get(k)
-        vu = mu.get(k)
-        if v is None and vu is None:
-            print(f"  {k:<30} n/a")
-        elif isinstance(v, (int, float)) and isinstance(vu, (int, float)):
-            print(f"  {k:<30} scaled {v:>9.4f}   unscaled {vu:>9.4f}")
-    rs = m.get("rolling_sharpe_3y", {})
-    rs_u = mu.get("rolling_sharpe_3y", {})
-    if rs and rs.get("mean") is not None:
-        mean_u = rs_u.get("mean") if rs_u else None
-        std_u = rs_u.get("std") if rs_u else None
-        print(
-            f"  {'rolling_sharpe_3y_mean':<30} scaled {rs['mean']:>9.4f}"
-            + (f"   unscaled {mean_u:>9.4f}" if mean_u is not None else "")
-        )
-        print(
-            f"  {'rolling_sharpe_3y_std':<30} scaled {rs['std']:>9.4f}"
-            + (f"   unscaled {std_u:>9.4f}" if std_u is not None else "")
-        )
-    print()
+metric_keys = ("cumulative_return", "annualised_return", "annualised_vol", "sharpe_ratio", "max_drawdown", "n_rebalances")
+
+all_variant_metrics = {}
+combined_rows = []
+
+for variant_name in all_results:
+    marker = ""
+    if variant_name == best_variant:
+        marker += " (best by validation rank correlation)"
+    if variant_name == best_sharpe_variant:
+        marker += " (best by validation long short sharpe)"
+
+    variant_metrics_path = cfg.results_dir / f"metrics_{variant_name}.json"
+    with open(variant_metrics_path, "r") as f:
+        saved_metrics = json.load(f)
+    six_month_metrics = saved_metrics["portfolio_metrics"]
+    all_variant_metrics[variant_name] = six_month_metrics
+
+    print(f"Detailed test set portfolio metrics for {variant_name}{marker}:")
+    for label, label_u in report_labels:
+        print(f"{label}:")
+        m = six_month_metrics[label]
+        mu = six_month_metrics[label_u]
+        for k in metric_keys:
+            v = m.get(k)
+            vu = mu.get(k)
+            if v is None and vu is None:
+                print(f"  {k:<30} n/a")
+            elif isinstance(v, (int, float)) and isinstance(vu, (int, float)):
+                print(f"  {k:<30} scaled {v:>9.4f}   unscaled {vu:>9.4f}")
+            for scaling, value in (("scaled", v), ("unscaled", vu)):
+                if isinstance(value, (int, float)):
+                    combined_rows.append({
+                        "variant": variant_name, "construction": label,
+                        "scaling": scaling, "metric": k, "value": value,
+                    })
+
+combined_df = pd.DataFrame(combined_rows)
+combined_path = cfg.results_dir / "all_variants_portfolio_metrics.csv"
+combined_df.to_csv(combined_path, index=False)
+print(f"Combined portfolio metrics for all variants written to {combined_path}")
+
+wide_df = combined_df.pivot_table(
+    index=["variant", "construction", "scaling"],
+    columns="metric",
+    values="value",
+).reset_index()
+wide_df = wide_df[["variant", "construction", "scaling"] + list(metric_keys)]
+wide_path = cfg.results_dir / "all_variants_portfolio_metrics_wide.csv"
+wide_df.to_csv(wide_path, index=False)
+print(f"Wide format combined portfolio metrics written to {wide_path}")
 
 
 # Cleanup
-for variant_name, variant_model in variant_models.items():
-    del variant_model
+for variant_name, model_list in variant_models.items():
+    for m in model_list:
+        del m
 del variant_models, test_ds, val_ds
 gc.collect()
 if torch.cuda.is_available():
