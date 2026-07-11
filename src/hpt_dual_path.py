@@ -5,7 +5,6 @@ import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-import typing
 
 import numpy as np
 import optuna
@@ -24,32 +23,25 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# Tuning configuration
-
 @dataclass
 class TuningConfig:
-    # Paths to processed data produced by the preprocessing pipeline
     train_path: Path = Path("data/processed/train.parquet")
     val_path: Path = Path("data/processed/val.parquet")
     col_metadata_path: Path = Path("data/processed/column_metadata.json")
     country_lookup_path: Path = Path("data/processed/country_lookup.parquet")
-    results_dir: Path = Path("results/transformer/transformer-hpt")
+    results_dir: Path = Path("results1/transformer/transformer-hpt")
 
-    # Optuna study settings
     n_trials: int = 50
     n_startup_trials: int = 10
     n_warmup_steps: int = 6
     seed: int = 42
     db_name: str = "hpt_dual_path.db"
 
-    # Training budget per trial (shorter than main training to allow more trials)
     max_epochs: int = 50
     patience: int = 8
 
-    # Fixed architecture parameters not included in the search space
     min_firms_attention: int = 10
 
-    # Encoding variants to tune
     variants: tuple = ("linear", "per_feature", "ple", "periodic", "fourier")
 
 
@@ -61,8 +53,6 @@ np.random.seed(tcfg.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(tcfg.seed)
 
-
-# Column setup from saved metadata
 
 with open(tcfg.col_metadata_path, "r") as f:
     col_meta = json.load(f)
@@ -88,14 +78,9 @@ print(f"Countries, {len(col_meta['country_codes'])}")
 print(f"Device, {device}")
 
 
-# Dataset
 class CrossSectionalDataset(Dataset):
-    """Stores one tensor batch per calendar month containing the K0 and K1
-    characteristic tensors, binary missingness flags, integer country identifiers,
-    continuous return targets, and valid-observation masks."""
 
-    def __init__(self, df, k0_cols, k1_cols, k0_miss, k1_miss,
-                 target_col_list, country_lookup):
+    def __init__(self, df, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, country_lookup):
         dates = sorted(df["eom"].unique())
         self.monthly_data = []
         df = df.merge(country_lookup, on=["id", "eom"], how="left")
@@ -116,11 +101,7 @@ class CrossSectionalDataset(Dataset):
                 vals[~valid_mask] = 0.0
                 targets[tc] = torch.tensor(vals, dtype=torch.float32)
                 valid_masks[tc] = torch.tensor(valid_mask, dtype=torch.bool)
-            self.monthly_data.append({
-                "k0": k0, "k1": k1, "k0_miss": k0_m, "k1_miss": k1_m,
-                "country_ids": cids, "firm_ids": firm_ids,
-                "targets": targets, "valid_masks": valid_masks,
-            })
+            self.monthly_data.append({"k0": k0, "k1": k1, "k0_miss": k0_m, "k1_miss": k1_m, "country_ids": cids, "firm_ids": firm_ids, "targets": targets, "valid_masks": valid_masks})
         del df
         gc.collect()
 
@@ -132,7 +113,6 @@ class CrossSectionalDataset(Dataset):
 
 
 def load_dataset(path, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, country_lookup):
-    """Load a processed parquet split and return a CrossSectionalDataset."""
     available = set(pq.read_schema(path).names)
     required = ["id", "eom"] + k0_cols + k1_cols + k0_miss + k1_miss + target_col_list
     load_cols = [c for c in required if c in available]
@@ -143,13 +123,9 @@ def load_dataset(path, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, coun
     for col in k0_cols + k1_cols + k0_miss + k1_miss:
         if df[col].isna().any():
             df[col] = df[col].fillna(0.0)
-    return CrossSectionalDataset(
-        df, k0_cols, k1_cols, k0_miss, k1_miss,
-        target_col_list, country_lookup
-    )
+    return CrossSectionalDataset(df, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, country_lookup)
 
 
-# Architecture
 class GRN(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
@@ -188,18 +164,17 @@ class PerFeatureTokeniser(nn.Module):
 
 
 class PiecewiseLinearEncoder(nn.Module):
+    boundaries: torch.Tensor
+
     def __init__(self, n_features, d_model, num_bins=16):
         super().__init__()
         self.register_buffer("boundaries", torch.linspace(-0.5, 0.5, num_bins + 1))
         self.feature_weights = nn.Parameter(torch.randn(n_features, num_bins, d_model) * 0.02)
 
     def forward(self, x):
-        boundaries = typing.cast(torch.Tensor, self.boundaries)
-        t_lower = boundaries[:-1]
-        t_upper = boundaries[1:]
-        activations = torch.clamp(
-            (x.unsqueeze(-1) - t_lower) / (t_upper - t_lower + 1e-8), 0.0, 1.0
-        )
+        t_lower = self.boundaries[:-1]
+        t_upper = self.boundaries[1:]
+        activations = torch.clamp((x.unsqueeze(-1) - t_lower) / (t_upper - t_lower + 1e-8), 0.0, 1.0)
         return torch.einsum("bnk,nkd->bnd", activations, self.feature_weights)
 
 
@@ -240,56 +215,43 @@ def build_encoder(variant, n_features, d_model, ple_bins=16, periodic_freq=32):
         raise ValueError(f"Unknown encoding variant: {variant}")
 
 
-class MultiHeadAttention(nn.Module):
-    """Kelly, Kuznetsov, Malamud, and Xu (2025), equation 13. Bilinear
-    per-head attention sigma(Y W_h Y') Y V_h, summed across heads, dense
-    softmax with no top-k truncation. No dropout, matching the paper.
-    No 1/sqrt(d_model) scaling; a diagnostic on a real trained checkpoint
-    showed combining scaling with cross-sectional rank normalisation of the
-    input (see _cross_sectional_soft_norm) undid most of the normalisation's
-    benefit. The normalisation is what fixes the attention collapse; see
-    nonlinear_dualapproach.py for the full rationale."""
+class AttentionHead(nn.Module):
 
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, init_scale):
         super().__init__()
-        self.n_heads = n_heads
-        self.w = nn.ParameterList([
-            nn.Parameter(torch.randn(d_model, d_model) / math.sqrt(d_model))
-            for _ in range(n_heads)
-        ])
-        self.v = nn.ModuleList([
-            nn.Linear(d_model, d_model, bias=False) for _ in range(n_heads)
-        ])
+        self.w = nn.Parameter(torch.randn(d_model, d_model) * init_scale)
+        self.v = nn.Parameter(torch.randn(d_model, d_model) * init_scale)
+        self.scale = 1.0 / math.sqrt(d_model)
 
     def forward(self, y):
-        head_outputs = []
-        head_weights = []
-        for h in range(self.n_heads):
-            scores = y @ self.w[h] @ y.t()
-            weights = F.softmax(scores, dim=-1)
-            head_outputs.append(weights @ self.v[h](y))
-            head_weights.append(weights)
-        out = torch.stack(head_outputs, dim=0).sum(dim=0)
-        return out, torch.stack(head_weights, dim=0)
+        scores = (y @ self.w @ y.t()) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        return attn @ (y @ self.v), attn
 
 
 class TransformerBlock(nn.Module):
-    """Kelly, Kuznetsov, Malamud, and Xu (2025), equations 13-17. Bare
-    residual connections with no LayerNorm, single hidden layer ReLU
-    feed-forward: T(Y) = F^R(A^R(Y)). No dropout, matching the paper."""
 
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, n_heads)
-        self.w1 = nn.Linear(d_model, d_ff)
-        self.w2 = nn.Linear(d_ff, d_model)
+        init_scale = 1.0 / d_model
+        self.heads = nn.ModuleList([AttentionHead(d_model, init_scale) for _ in range(n_heads)])
+        self.w1 = nn.Parameter(torch.randn(d_model, d_ff) * (1.0 / d_ff))
+        self.b1 = nn.Parameter(torch.zeros(d_ff))
+        self.w2 = nn.Parameter(torch.randn(d_ff, d_model) * init_scale)
+        self.b2 = nn.Parameter(torch.zeros(d_model))
 
     def forward(self, x):
-        attn_out, attn_w = self.attention(x)
-        a_r = attn_out + x
-        f = self.w2(F.relu(self.w1(a_r)))
-        f_r = f + a_r
-        return f_r, attn_w
+        head_outputs = []
+        head_weights = []
+        for head in self.heads:
+            out, attn = head(x)
+            head_outputs.append(out)
+            head_weights.append(attn)
+        attn_out = torch.stack(head_outputs, dim=0).sum(dim=0)
+        y = attn_out + x
+        ffn_out = F.relu(y @ self.w1 + self.b1) @ self.w2 + self.b2
+        y = ffn_out + y
+        return y, torch.stack(head_weights, dim=0)
 
 
 class AttentiveAggregation(nn.Module):
@@ -315,8 +277,7 @@ class FirmScoreHead(nn.Module):
         for i in range(n_layers):
             in_dim = d_model if i == 0 else d_ff
             modules.extend([nn.Linear(in_dim, d_ff), nn.ELU(), nn.Dropout(dropout)])
-        final_in = d_ff if n_layers > 0 else d_model
-        modules.append(nn.Linear(final_in, 1))
+        modules.append(nn.Linear(d_ff if n_layers > 0 else d_model, 1))
         self.net = nn.Sequential(*modules)
 
     def forward(self, z):
@@ -324,12 +285,6 @@ class FirmScoreHead(nn.Module):
 
 
 def _cross_sectional_soft_norm(z_c, temperature=2.0):
-    """Normalises each of z_c's d_model columns across the firm axis, then
-    bounds the result to the open interval (-0.5, 0.5) via a scaled
-    hyperbolic tangent, so gradient from Path 2's contribution to the loss
-    can reach the shared encoder and aggregation layers, unlike the earlier
-    hard rank based normalisation. See nonlinear_dualapproach.py for the
-    full rationale."""
     n = z_c.shape[0]
     if n <= 1:
         return torch.zeros_like(z_c)
@@ -345,28 +300,14 @@ class DualPathTransformer(nn.Module):
         self.config = config
         n_k0 = len(k0_chars)
         n_k1 = len(k1_chars)
-        self.k0_encoder = build_encoder(
-            config.encoding_variant, n_k0, config.d_model,
-            ple_bins=config.ple_num_bins, periodic_freq=config.periodic_num_freq,
-        )
-        self.k1_encoder = build_encoder(
-            config.encoding_variant, n_k1, config.d_model,
-            ple_bins=config.ple_num_bins, periodic_freq=config.periodic_num_freq,
-        )
+        self.k0_encoder = build_encoder(config.encoding_variant, n_k0, config.d_model, ple_bins=config.ple_num_bins, periodic_freq=config.periodic_num_freq)
+        self.k1_encoder = build_encoder(config.encoding_variant, n_k1, config.d_model, ple_bins=config.ple_num_bins, periodic_freq=config.periodic_num_freq)
         self.k0_static_emb = nn.Parameter(torch.randn(n_k0, config.d_model) * 0.02)
         self.k1_static_emb = nn.Parameter(torch.randn(n_k1, config.d_model) * 0.02)
         self.k0_agg = AttentiveAggregation(config.d_model)
         self.k1_agg = AttentiveAggregation(config.d_model)
         self.base_head_6m = FirmScoreHead(config.d_model, config.d_ff, config.n_mlp_layers, config.dropout)
-        # z is cross-sectionally rank-normalised within each country group
-        # before Path 2's attention, via _cross_sectional_soft_norm; see
-        # nonlinear_dualapproach.py for the full rationale, including why a
-        # z-score based normalisation was tried first and rejected.
-        self.blocks = nn.ModuleList([
-            TransformerBlock(config.d_model, config.n_heads, config.d_ff,
-                             config.dropout)
-            for _ in range(config.n_layers)
-        ])
+        self.blocks = nn.ModuleList([TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout) for _ in range(config.n_layers)])
         self.adj_head_6m = nn.Sequential(nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1))
         self.min_firms = config.min_firms_attention
 
@@ -390,21 +331,10 @@ class DualPathTransformer(nn.Module):
             for block in self.blocks:
                 z_c, _ = block(z_c)
             adj_6m[mask] = self.adj_head_6m(z_c).squeeze(-1)
-        return {
-            "scores_6m": base_6m + adj_6m,
-            "base_6m": base_6m,
-            "adj_6m": adj_6m,
-        }
+        return {"scores_6m": base_6m + adj_6m, "base_6m": base_6m, "adj_6m": adj_6m}
 
-
-# Training components
 
 def _differentiable_long_short_return(scores, returns, valid_mask):
-    """Differentiable per cross-section long short portfolio return. Firms
-    with a valid forward return are split into long and short legs by the
-    cross sectional mean of the score. Within each leg the weights are
-    given by a softmax over the demeaned score, so each leg sums to unity
-    and the portfolio is dollar neutral by construction."""
     valid_scores = scores[valid_mask]
     valid_returns = returns[valid_mask]
     n_valid = valid_scores.shape[0]
@@ -425,12 +355,6 @@ def _differentiable_long_short_return(scores, returns, valid_mask):
 
 
 def compute_msrr_loss(output, targets, valid_masks, config):
-    """Maximum Sharpe Ratio Regression loss for the six month long short
-    portfolio. Following Kelly, Kuznetsov, Malamud, and Xu (2025), the
-    main loss is the squared deviation of the realised portfolio return
-    from a unit target. The auxiliary loss applies the same objective to
-    the Path 1 base scores so that the per firm encoder remains
-    independently predictive."""
     device_ = output["scores_6m"].device
     target = targets["target_6m"]
     valid = valid_masks["target_6m"]
@@ -444,7 +368,6 @@ def compute_msrr_loss(output, targets, valid_masks, config):
 
 
 def compute_rank_correlation(scores, targets, valid_mask):
-    """Spearman rank correlation between predicted scores and realised returns."""
     if valid_mask.sum() < 10:
         return 0.0
     pred = scores[valid_mask]
@@ -499,15 +422,6 @@ def train_one_epoch(model, dataset, optimizer, config, scaler):
 
 @torch.no_grad()
 def evaluate(model, dataset, config):
-    """Evaluate the model on a dataset and return the validation msrr
-    loss together with the 6 month combined, base, and adjustment score
-    rank correlations. The base score correlation quantifies the
-    predictive content of the per firm encoder alone, before the cross
-    sectional adjustment is added, and the adjustment correlation
-    quantifies the predictive content of path 2 in isolation, which
-    together with the base correlation shows whether the cross sectional
-    block is contributing meaningful information beyond path 1 rather
-    than merely reproducing it."""
     model.eval()
     total_loss = 0.0
     total_corr_6m = 0.0
@@ -525,26 +439,13 @@ def evaluate(model, dataset, config):
         valid_masks = {k: v.to(device) for k, v in batch["valid_masks"].items()}
         output = model(k0, k1, k0_miss, k1_miss, cids)
         total_loss += compute_msrr_loss(output, targets, valid_masks, config).item()
-        total_corr_6m += compute_rank_correlation(
-            output["scores_6m"], targets["target_6m"], valid_masks["target_6m"]
-        )
-        total_corr_base_6m += compute_rank_correlation(
-            output["base_6m"], targets["target_6m"], valid_masks["target_6m"]
-        )
-        total_corr_adj_6m += compute_rank_correlation(
-            output["adj_6m"], targets["target_6m"], valid_masks["target_6m"]
-        )
+        total_corr_6m += compute_rank_correlation(output["scores_6m"], targets["target_6m"], valid_masks["target_6m"])
+        total_corr_base_6m += compute_rank_correlation(output["base_6m"], targets["target_6m"], valid_masks["target_6m"])
+        total_corr_adj_6m += compute_rank_correlation(output["adj_6m"], targets["target_6m"], valid_masks["target_6m"])
         n += 1
     m = max(n, 1)
-    return {
-        "loss": total_loss / m,
-        "rank_corr_6m": total_corr_6m / m,
-        "rank_corr_base_6m": total_corr_base_6m / m,
-        "rank_corr_adj_6m": total_corr_adj_6m / m,
-    }
+    return {"loss": total_loss / m, "rank_corr_6m": total_corr_6m / m, "rank_corr_base_6m": total_corr_base_6m / m, "rank_corr_adj_6m": total_corr_adj_6m / m}
 
-
-# Hyperparameter search space
 
 def sample_hyperparameters(trial, variant):
 
@@ -553,35 +454,30 @@ def sample_hyperparameters(trial, variant):
     d_ff_mult = trial.suggest_categorical("d_ff_mult", [2, 4])
     n_layers = trial.suggest_int("n_layers", 1, 3)
     dropout = trial.suggest_float("dropout", 0.01, 0.4)
-    # top_k_attention removed from the search space: MultiHeadAttention
-    # (Kelly, Kuznetsov, Malamud, and Xu, 2025) uses dense softmax attention
-    # with no truncation, so sampling this would waste trial diversity on a
-    # parameter the model no longer reads.
     n_mlp_layers = trial.suggest_int("n_mlp_layers", 1, 3)
     lambda_aux = trial.suggest_float("lambda_aux", 0.1, 0.5)
     lr = trial.suggest_float("lr", 5e-5, 5e-3, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-2, log=True)
     grad_clip = trial.suggest_float("grad_clip", 0.1, 5.0)
 
-    # Variant-specific encoding parameters
     ple_num_bins = trial.suggest_categorical("ple_num_bins", [8, 16, 32]) if variant == "ple" else 16
-    periodic_num_freq = (
-        trial.suggest_categorical("periodic_num_freq", [16, 32, 64])
-        if variant in ("periodic", "fourier") else 32
-    )
+    periodic_num_freq = trial.suggest_categorical("periodic_num_freq", [16, 32, 64]) if variant in ("periodic", "fourier") else 32
 
     return {
-        "d_model": d_model, "n_heads": n_heads,
-        "d_ff": d_model * d_ff_mult, "n_layers": n_layers,
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "d_ff": d_model * d_ff_mult,
+        "n_layers": n_layers,
         "dropout": dropout,
-        "n_mlp_layers": n_mlp_layers, "lambda_aux": lambda_aux,
-        "learning_rate": lr, "weight_decay": weight_decay,
+        "n_mlp_layers": n_mlp_layers,
+        "lambda_aux": lambda_aux,
+        "learning_rate": lr,
+        "weight_decay": weight_decay,
         "grad_clip": grad_clip,
-        "ple_num_bins": ple_num_bins, "periodic_num_freq": periodic_num_freq,
+        "ple_num_bins": ple_num_bins,
+        "periodic_num_freq": periodic_num_freq,
     }
 
-
-# Config used inside the objective function
 
 @dataclass
 class TrialConfig:
@@ -595,11 +491,6 @@ class TrialConfig:
     n_mlp_layers: int = 2
     lambda_aux: float = 0.3
     min_firms_attention: int = 10
-    # linear warmup over the first warmup_epochs epochs, mirroring
-    # nonlinear_dualapproach.py. Without this, every trial trained its
-    # first epoch at the full sampled lr, which ranges up to 5e-3, with no
-    # ramp, exposing fresh random weights to the same instability the
-    # warmup was introduced to prevent in the main training script.
     warmup_epochs: int = 5
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
@@ -616,14 +507,6 @@ class TrialConfig:
 
 @torch.no_grad()
 def _validation_long_short_sharpe(model, dataset, config, rebalance_freq=6, tc_bps=25, periods_per_year=2):
-    """Run a long short mean split portfolio simulation against the
-    validation dataset and return its annualised Sharpe ratio. The leg
-    construction mirrors _differentiable_long_short_return exactly: firms
-    with a valid forward return are split at the cross sectional mean
-    score, not a fixed quantile, so the quantity Optuna optimises is
-    computed on the same portfolio definition the model is trained
-    against and the same construction eval_dual_path.py reports at
-    test time."""
     model.eval()
     raw_ls_returns = []
     portfolio_returns = []
@@ -647,11 +530,7 @@ def _validation_long_short_sharpe(model, dataset, config, rebalance_freq=6, tc_b
             residual_total = weights[residual].sum()
             if residual_total <= 1e-12:
                 break
-            weights = torch.where(
-                residual,
-                weights * (1.0 + excess / residual_total),
-                weights,
-            )
+            weights = torch.where(residual, weights * (1.0 + excess / residual_total), weights)
         return weights
 
     def _turnover(prev_ids, curr_ids):
@@ -702,14 +581,10 @@ def _validation_long_short_sharpe(model, dataset, config, rebalance_freq=6, tc_b
         st = _turnover(prev_short_ids, short_ids)
         base_turnover = lt + st
         if len(raw_ls_returns) >= config.vol_lookback:
-            recent = np.array(raw_ls_returns[-config.vol_lookback:])
+            recent = np.array(raw_ls_returns[-config.vol_lookback :])
             realised_vol = recent.std(ddof=1) * np.sqrt(periods_per_year)
             leverage = config.target_vol / max(realised_vol, 1e-6)
-            leverage = float(np.clip(
-                leverage,
-                1.0 / config.max_leverage_long_short,
-                config.max_leverage_long_short,
-            ))
+            leverage = float(np.clip(leverage, 1.0 / config.max_leverage_long_short, config.max_leverage_long_short))
         else:
             leverage = 1.0
         tc = leverage * base_turnover * tc_bps / 10000.0
@@ -726,8 +601,6 @@ def _validation_long_short_sharpe(model, dataset, config, rebalance_freq=6, tc_b
     return float(ann_ret / max(ann_vol, 1e-8))
 
 
-# Objective function
-
 def objective(trial, variant, train_ds, val_ds, tuning_config):
     params = sample_hyperparameters(trial, variant)
 
@@ -740,15 +613,8 @@ def objective(trial, variant, train_ds, val_ds, tuning_config):
         setattr(cfg, key, val)
 
     model = DualPathTransformer(cfg).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
-    )
-    # Within trial early stopping is driven by the validation MSRR loss,
-    # which aligns the model selection signal with the training objective.
-    # ReduceLROnPlateau therefore runs in min mode.
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
     scaler = torch.GradScaler(device.type)
 
     best_val_loss = float("inf")
@@ -784,16 +650,8 @@ def objective(trial, variant, train_ds, val_ds, tuning_config):
             "base_corr_6m": val_base_corr_6m,
             "adj_corr_6m": val_adj_corr_6m,
         }
-        pd.DataFrame([epoch_row]).to_csv(
-            epoch_log_path, mode="a", header=not epoch_log_path.exists(), index=False
-        )
+        pd.DataFrame([epoch_row]).to_csv(epoch_log_path, mode="a", header=not epoch_log_path.exists(), index=False)
 
-        # Report the validation rank correlation to the pruner at every
-        # epoch. The pruning signal remains rank correlation rather than
-        # the MSRR loss because the pruner expects a maximise direction
-        # signal, and the rank correlation is bounded in [-1, 1] which
-        # makes the median comparison well behaved across trials. The
-        # within trial best epoch is still selected on the MSRR loss.
         trial.report(val_corr_6m, epoch)
         if trial.should_prune():
             for key, val in epoch_row.items():
@@ -806,11 +664,6 @@ def objective(trial, variant, train_ds, val_ds, tuning_config):
                 torch.cuda.empty_cache()
             raise optuna.exceptions.TrialPruned()
 
-        # epoch > cfg.warmup_epochs excludes the ramp-up window from ever
-        # becoming the saved checkpoint. Without this, an epoch trained at a
-        # still-low warmup lr could register a deceptively low val_loss before
-        # the model has done any meaningful learning, and that checkpoint
-        # would then be reloaded below for the Sharpe ratio Optuna optimises.
         if epoch > cfg.warmup_epochs and val_loss < best_val_loss - 1e-5:
             best_val_loss = val_loss
             best_epoch_metrics = dict(epoch_row)
@@ -841,19 +694,13 @@ def objective(trial, variant, train_ds, val_ds, tuning_config):
     return val_sharpe
 
 
-# Terminal output helpers
-
 def _print_trial_row(trial, study, w):
-    """Print one summary line after a trial completes or is pruned, 
-    including the validation long short Sharpe ratio, the base 
-    f_firm 6 month rank correlation, and the running best Sharpe ratio"""
     pruned = trial.state == optuna.trial.TrialState.PRUNED
     value = float("nan") if pruned else trial.value
     try:
         best = study.best_value
-        best_t = study.best_trial.number + 1
     except Exception:
-        best, best_t = float("nan"), 0
+        best = float("nan")
     status = "PRUNED" if pruned else "DONE"
     marker = "  *" if (not pruned and trial.number == study.best_trial.number) else ""
     p = trial.params
@@ -864,10 +711,7 @@ def _print_trial_row(trial, study, w):
     ua = trial.user_attrs
     base_corr_6m = ua.get("best_base_corr_6m", ua.get("last_base_corr_6m", float("nan")))
     adj_corr_6m = ua.get("best_adj_corr_6m", ua.get("last_adj_corr_6m", float("nan")))
-    print(
-        f"{trial.number + 1:>5}{value:>8.4f}{base_corr_6m:>8.4f}{adj_corr_6m:>8.4f}{best:>8.4f}  "
-        f"d={d_model:<3} h={n_heads:<2} L={n_layers} lr={lr:.2e}{status:<6} {marker}"
-    )
+    print(f"{trial.number + 1:>5}{value:>8.4f}{base_corr_6m:>8.4f}{adj_corr_6m:>8.4f}{best:>8.4f}  " f"d={d_model:<3} h={n_heads:<2} L={n_layers}  lr={lr:.2e}  " f"{status:<6}{marker}")
     sys.stdout.flush()
 
 
@@ -893,9 +737,6 @@ def _print_best_params(study, variant, results_dir):
     print(sep)
     print(f"{'d_ff (derived)':<25} {best.params['d_model'] * best.params['d_ff_mult']}")
 
-    # Combined and base score rank correlations at the best epoch, recorded
-    # as user attributes by the objective function. The base value quantifies
-    # the f_firm contribution alone, before the cross sectional adjustment.
     ua = best.user_attrs
     print(sep)
     print(f"{'best epoch':<25} {ua.get('best_epoch', 'n/a')}")
@@ -907,7 +748,6 @@ def _print_best_params(study, variant, results_dir):
     print(f"{'corr 6m, adjustment':<25} {ua.get('best_adj_corr_6m', float('nan')):.6f}")
     print(f"{'val Sharpe LS':<25} {ua.get('val_sharpe_ls', float('nan')):.6f}")
 
-    # Study statistics
     n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
     print(sep)
@@ -915,8 +755,7 @@ def _print_best_params(study, variant, results_dir):
 
     values = [t.value for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
     if values:
-        print(f"   Val Sharpe LS  mean={np.mean(values):.4f}  std={np.std(values):.4f}  "
-              f"min={np.min(values):.4f}  max={np.max(values):.4f}")
+        print(f"   Val Sharpe LS  mean={np.mean(values):.4f}  std={np.std(values):.4f}  " f"min={np.min(values):.4f}  max={np.max(values):.4f}")
     print(bar)
 
     out_path = results_dir / f"best_params_{variant}.json"
@@ -924,30 +763,15 @@ def _print_best_params(study, variant, results_dir):
     payload["d_ff_derived"] = best.params["d_model"] * best.params["d_ff_mult"]
     payload["best_val_sharpe_ls"] = best.value
     payload["trial_number"] = best.number + 1
-    for key in [
-        "best_epoch", "n_epochs_trained",
-        "best_train_loss", "best_val_loss",
-        "best_corr_6m", "best_base_corr_6m", "best_adj_corr_6m",
-        "val_sharpe_ls",
-    ]:
+    for key in ["best_epoch", "n_epochs_trained", "best_train_loss", "best_val_loss", "best_corr_6m", "best_base_corr_6m", "best_adj_corr_6m", "val_sharpe_ls"]:
         if key in ua:
             payload[key] = ua[key]
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"  Best params saved, {out_path}")
-    
 
 
 def _save_trials_dataframe(study, variant, results_dir):
-    """Export the full trial history for one variant to a csv file. The
-    dataframe returned by optuna includes the optuna objective value (the
-    combined 6 month rank correlation), every sampled hyperparameter such as
-    d_model, and the user attributes recorded by the objective function,
-    which cover the base f_firm rank correlations, the validation loss, the
-    training loss, and the epoch at which the best value was reached. This
-    table is the primary input for any cross trial analysis, such as relating
-    the embedding dimension to the gap between the combined score and the
-    base score rank correlations."""
     df = study.trials_dataframe()
     if df.empty:
         print("  No trials to export.")
@@ -956,32 +780,19 @@ def _save_trials_dataframe(study, variant, results_dir):
     out_path = results_dir / f"trials_{variant}.csv"
     df.to_csv(out_path, index=False)
     print(f"  Trial history saved, {out_path}")
-    
+
     return df
 
 
 def run_study(variant, train_ds, val_ds, tuning_config):
-    """Create or resume an Optuna study for one encoding variant and run
-    n_trials trials. The study is persisted to SQLite at results/hpt_dual_path.db
-    so that completed trials are not lost if the process is interrupted.
-    n_jobs is set to 1 to prevent threading race conditions in the single-GPU
-    forward pass and dataset access."""
     db_path = tuning_config.results_dir / tuning_config.db_name
     storage = f"sqlite:///{db_path}"
     study_name = f"dual_path_{variant}"
 
-    pruner = MedianPruner(
-        n_startup_trials=tuning_config.n_startup_trials,
-        n_warmup_steps=tuning_config.n_warmup_steps,
-        interval_steps=1,
-    )
+    pruner = MedianPruner(n_startup_trials=tuning_config.n_startup_trials, n_warmup_steps=tuning_config.n_warmup_steps, interval_steps=1)
     sampler = TPESampler(seed=tuning_config.seed)
 
-    study = optuna.create_study(
-        study_name=study_name, direction="maximize",
-        storage=storage, load_if_exists=True,
-        pruner=pruner, sampler=sampler,
-    )
+    study = optuna.create_study(study_name=study_name, direction="maximize", storage=storage, load_if_exists=True, pruner=pruner, sampler=sampler)
 
     n_existing = len(study.trials)
     n_remaining = max(0, tuning_config.n_trials - n_existing)
@@ -991,7 +802,7 @@ def run_study(variant, train_ds, val_ds, tuning_config):
     sep = "-" * w
     print(bar)
     print(f"Study, {study_name}")
-    print(f"Target, maximise validation long short Sharpe ratio")
+    print("Target, maximise validation long short Sharpe ratio")
     print(f"Total trials, {tuning_config.n_trials}")
     print(f"max_epochs per trial, {tuning_config.max_epochs}  |  patience, {tuning_config.patience}")
     print(f"n_startup_trials, {tuning_config.n_startup_trials}  |  n_warmup_steps, {tuning_config.n_warmup_steps}")
@@ -1003,35 +814,22 @@ def run_study(variant, train_ds, val_ds, tuning_config):
     if n_remaining == 0:
         print("All trials already completed")
     else:
+
         def _callback(study, trial):
             _print_trial_row(trial, study, w)
 
-        study.optimize(
-            lambda trial: objective(trial, variant, train_ds, val_ds, tuning_config),
-            n_trials=n_remaining,
-            n_jobs=1,
-            callbacks=[_callback],
-            gc_after_trial=True,
-        )
+        study.optimize(lambda trial: objective(trial, variant, train_ds, val_ds, tuning_config), n_trials=n_remaining, n_jobs=1, callbacks=[_callback], gc_after_trial=True)
 
     _print_best_params(study, variant, tuning_config.results_dir)
     _save_trials_dataframe(study, variant, tuning_config.results_dir)
     return study
 
 
-# Main execution
-
 print("Loading training and validation datasets")
 print("(datasets are loaded once and shared across all trials for each variant)")
 
-train_ds = load_dataset(
-    tcfg.train_path, k0_feature_cols, k1_feature_cols,
-    k0_miss_cols, k1_miss_cols, target_cols, country_lookup_df,
-)
-val_ds = load_dataset(
-    tcfg.val_path, k0_feature_cols, k1_feature_cols,
-    k0_miss_cols, k1_miss_cols, target_cols, country_lookup_df,
-)
+train_ds = load_dataset(tcfg.train_path, k0_feature_cols, k1_feature_cols, k0_miss_cols, k1_miss_cols, target_cols, country_lookup_df)
+val_ds = load_dataset(tcfg.val_path, k0_feature_cols, k1_feature_cols, k0_miss_cols, k1_miss_cols, target_cols, country_lookup_df)
 print(f"Train months, {len(train_ds)}  |  Val months, {len(val_ds)}")
 
 
@@ -1040,7 +838,6 @@ for variant in tcfg.variants:
     study = run_study(variant, train_ds, val_ds, tcfg)
     all_studies[variant] = study
 
-# Final cross-variant summary
 
 w = 90
 bar = "=" * w
@@ -1066,12 +863,6 @@ for variant, study in all_studies.items():
         print(f"  {variant:<14}  {'no completed trials':>40}")
 print(bar)
 
-# Master trial history across all variants. Each row corresponds to one
-# trial and carries its sampled hyperparameters (including d_model), the
-# combined 6 month rank correlation returned to optuna, and the base f_firm
-# rank correlations for all three horizons recorded as user attributes. This
-# table supports a direct comparison of how the embedding dimension relates
-# to the combined score and to the base score alone.
 all_trials_frames = []
 for variant, study in all_studies.items():
     df = study.trials_dataframe()
