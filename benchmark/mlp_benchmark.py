@@ -11,11 +11,17 @@ import pandas as pd
 import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import optuna
 from safetensors.torch import save_file as safetensors_save
-from scipy.stats import spearmanr
 import matplotlib.pyplot as plt
+
+from benchmark_common import (
+    portfolio_metrics, capped_softmax_weights,
+    mean_split_legs, long_only_leg,
+    weight_l1_turnover, drift_weights,
+    apply_overlay_and_costs, apply_vol_target_monthly,
+    predict_at_dates, rank_correlation_oos
+)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings('ignore')
@@ -24,8 +30,7 @@ warnings.filterwarnings('ignore')
 cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if cuda_available else 'cpu')
 print(f'cuda available: {cuda_available}, device: {device}')
-if cuda_available:
-    print(f'device name: {torch.cuda.get_device_name(0)}')
+print(f'device name: {torch.cuda.get_device_name(0)}')
 
 
 # configuration
@@ -44,11 +49,21 @@ rebalance_freq = 6
 horizon_months = 6
 tc_bps = 25
 min_stocks = 30
+min_leg_stocks = 10
 ret_clip_low = -1.0
 ret_clip_high = 1.0
 
 target_vol = 0.10
+# vol_lookback_months drives the monthly resolution overlay, used only for
+# the monthly diagnostic simulation, which has 36 individual monthly return
+# observations to estimate trailing volatility from. vol_lookback_periods
+# drives the period resolution overlay, used for the headline summary
+# metrics, which only has this many six month rebalance period returns to
+# estimate trailing volatility from. the two are intentionally different
+# estimators over different sample sizes and are kept as separate constants
+# rather than one being derived from the other
 vol_lookback_months = 36
+vol_lookback_periods = 6
 max_leverage_long_only = 3.0
 max_leverage_long_short = 3.0
 max_position_weight = 0.05
@@ -62,7 +77,7 @@ optuna_seed = 24
 torch_seed = 24
 
 periods_per_year = 12.0 / rebalance_freq
-n_vol_periods = max(1, vol_lookback_months // rebalance_freq)
+n_vol_periods = vol_lookback_periods
 
 
 
@@ -105,12 +120,19 @@ needed = list(dict.fromkeys(
      if c in schema.names]
 ))
 
-df = pd.read_parquet(data_path, columns=needed)
-df['eom'] = pd.to_datetime(df['eom'])
+table = pq.read_table(data_path, columns=needed)
+cast_fields = []
+for field in table.schema:
+    if field.name in feature_cols and pa.types.is_float64(field.type):
+        cast_fields.append(field.with_type(pa.float32()))
+    else:
+        cast_fields.append(field)
+table = table.cast(pa.schema(cast_fields))
 
-for col in feature_cols:
-    if col in df.columns and df[col].dtype == np.float64:
-        df[col] = df[col].astype(np.float32)
+df = table.to_pandas()
+del table
+gc.collect()
+df['eom'] = pd.to_datetime(df['eom'])
 
 df[ret_col_1m] = df[ret_col_1m].clip(lower=ret_clip_low, upper=ret_clip_high)
 
@@ -221,195 +243,6 @@ class MLPPredictor:
             return self.model(x_t).cpu().numpy()
 
 
-# portfolio helpers. these are identical to tree_benchmark.py so that the
-# two benchmarks share exactly the same simulation and metrics conventions.
-
-def portfolio_metrics(rets, ppy, dates=None):
-    rets = np.asarray(rets, dtype=np.float64)
-    if len(rets) == 0:
-        out = {
-            'ann_ret': np.nan, 'ann_vol': np.nan, 'sharpe': np.nan,
-            'se_sharpe': np.nan, 'max_dd': np.nan, 'cum_return': np.nan,
-            'n_obs': 0,
-        }
-        if dates is not None:
-            out['per_year'] = {}
-        return out
-    n = len(rets)
-    ann_ret = float(rets.mean() * ppy)
-    ann_vol = float(rets.std() * np.sqrt(ppy))
-    sharpe = ann_ret / max(ann_vol, 1e-8)
-    se = float(np.sqrt((1.0 + 0.5 * sharpe ** 2) / n))
-    cw = np.cumprod(1.0 + rets)
-    pk = np.maximum.accumulate(cw)
-    max_dd = float(((pk - cw) / pk).max()) if len(cw) > 0 else 0.0
-    cum_return = float(cw[-1] - 1.0)
-
-    out = {
-        'ann_ret': ann_ret,
-        'ann_vol': ann_vol,
-        'sharpe': sharpe,
-        'se_sharpe': se,
-        'max_dd': max_dd,
-        'cum_return': cum_return,
-        'n_obs': n,
-    }
-
-    if dates is not None:
-        years = pd.DatetimeIndex(dates).year.to_numpy()
-        per_year = {}
-        for y in sorted(set(years.tolist())):
-            mask = years == y
-            sub = rets[mask]
-            if len(sub) < 1:
-                continue
-            y_ret = float(sub.mean() * ppy)
-            y_vol = float(sub.std() * np.sqrt(ppy))
-            y_sharpe = y_ret / max(y_vol, 1e-8)
-            ycw = np.cumprod(1.0 + sub)
-            ypk = np.maximum.accumulate(ycw)
-            y_dd = float(((ypk - ycw) / ypk).max())
-            per_year[int(y)] = {
-                'ann_ret': y_ret,
-                'ann_vol': y_vol,
-                'sharpe': y_sharpe,
-                'max_dd': y_dd,
-                'cum_return': float(ycw[-1] - 1.0),
-                'n_obs': int(len(sub)),
-            }
-        out['per_year'] = per_year
-
-    return out
-
-
-def _capped_softmax_weights(scores, max_weight, max_iter=20):
-    scores = np.asarray(scores, dtype=np.float64)
-    n = scores.shape[0]
-    if n == 0:
-        return np.zeros(0, dtype=np.float64)
-    if max_weight <= 1.0 / n + 1e-12:
-        return np.full(n, 1.0 / n, dtype=np.float64)
-    z = scores - scores.max()
-    w = np.exp(z)
-    s = w.sum()
-    if s <= 0 or not np.isfinite(s):
-        return np.full(n, 1.0 / n, dtype=np.float64)
-    w = w / s
-    for _ in range(max_iter):
-        over = w > max_weight
-        if not over.any():
-            break
-        excess = float((w[over] - max_weight).sum())
-        residual = ~over
-        residual_total = float(w[residual].sum())
-        if residual_total <= 1e-12:
-            break
-        w = np.where(over, max_weight, w)
-        w = np.where(residual, w * (1.0 + excess / residual_total), w)
-    return w
-
-
-def _renorm_over_valid(weights, valid):
-    weights = np.asarray(weights, dtype=np.float64)
-    valid = np.asarray(valid, dtype=bool)
-    if not valid.any():
-        return weights
-    valid_total = float(weights[valid].sum())
-    if valid_total <= 1e-12:
-        return weights
-    out = np.zeros_like(weights)
-    out[valid] = weights[valid] / valid_total
-    return out
-
-
-def _firm_id_turnover(prev_ids, curr_ids):
-    prev = set(prev_ids.tolist()) if prev_ids is not None else set()
-    curr = set(curr_ids.tolist())
-    if not curr:
-        return 0.0
-    return (len(curr - prev) + len(prev - curr)) / max(len(curr), 1)
-
-
-def _weight_l1_turnover(prev_ids, prev_w, curr_ids, curr_w):
-    if curr_ids is None or curr_w is None or len(curr_w) == 0:
-        return 0.0
-    curr_map = {}
-    for j in range(len(curr_ids)):
-        fid = int(curr_ids[j]) if not hasattr(curr_ids[j], 'item') else int(curr_ids[j].item())
-        curr_map[fid] = float(curr_w[j])
-    if prev_ids is None or prev_w is None or len(prev_w) == 0:
-        return float(sum(abs(v) for v in curr_map.values()))
-    prev_map = {}
-    for j in range(len(prev_ids)):
-        fid = int(prev_ids[j]) if not hasattr(prev_ids[j], 'item') else int(prev_ids[j].item())
-        prev_map[fid] = float(prev_w[j])
-    all_ids = set(prev_map.keys()) | set(curr_map.keys())
-    return float(sum(
-        abs(curr_map.get(fid, 0.0) - prev_map.get(fid, 0.0)) for fid in all_ids
-    ))
-
-
-def _drift_weights(prev_ids, prev_w, realised_returns_by_id):
-    if prev_ids is None or prev_w is None or len(prev_w) == 0:
-        return None, None
-    n = len(prev_w)
-    ids_list = []
-    growth = np.zeros(n, dtype=np.float64)
-    for j in range(n):
-        fid = int(prev_ids[j]) if not hasattr(prev_ids[j], 'item') else int(prev_ids[j].item())
-        ids_list.append(fid)
-        growth[j] = float(prev_w[j]) * (1.0 + float(realised_returns_by_id.get(fid, 0.0)))
-    g_sum = float(growth.sum())
-    if g_sum > 1e-12:
-        drifted = growth / g_sum
-    else:
-        drifted = growth
-    return ids_list, drifted
-
-
-def apply_period_vol_overlay(period_rets, n_vol_pds, ppy, max_lev):
-    period_rets = np.asarray(period_rets, dtype=np.float64)
-    n = len(period_rets)
-    leverage = np.ones(n, dtype=np.float64)
-    for t in range(n):
-        if t < n_vol_pds:
-            continue
-        trailing = period_rets[t - n_vol_pds:t]
-        if len(trailing) < 2:
-            continue
-        realised_vol = float(trailing.std() * np.sqrt(ppy))
-        lev = target_vol / max(realised_vol, 1e-8)
-        leverage[t] = float(np.clip(lev, 1.0 / max_lev, max_lev))
-    return leverage
-
-
-def apply_overlay_and_costs(leg_gross_rets, leg_tc, n_vol_pds, ppy, max_lev):
-    leg_gross_rets = np.asarray(leg_gross_rets, dtype=np.float64)
-    leg_tc = np.asarray(leg_tc, dtype=np.float64)
-    leverage_path = apply_period_vol_overlay(leg_gross_rets, n_vol_pds, ppy, max_lev)
-    unscaled_net = leg_gross_rets - leg_tc
-    scaled_net = leverage_path * leg_gross_rets - leverage_path * leg_tc
-    return scaled_net, unscaled_net, leverage_path
-
-
-def predict_at_dates(predictor, month_dates):
-    """Per firm predictions across the given dates."""
-    rows = []
-    for eom in month_dates:
-        if eom not in all_months:
-            continue
-        m = all_months[eom]
-        pred = predictor.predict(m['x'])
-        for k in range(len(m['ids'])):
-            rows.append({
-                'eom': eom,
-                'id': m['ids'][k],
-                'prediction': float(pred[k]),
-                'realised_return': float(m['r'][k]),
-            })
-    return pd.DataFrame(rows)
-
-
 def run_mean_split_simulation(predictor, month_dates):
     ls_period_rets, ls_period_dates = [], []
     ls_tc_history = []
@@ -450,45 +283,38 @@ def run_mean_split_simulation(predictor, month_dates):
             continue
 
         valid_ret = np.isfinite(r)
-        valid = valid_pred & valid_ret
+
+        legs = mean_split_legs(pred, valid_pred, valid_ret, min_leg_stocks)
+        lo_idx = long_only_leg(valid_pred, valid_ret, min_leg_stocks)
+        if legs is None or lo_idx is None:
+            continue
+        mean_score, long_idx, short_idx = legs
         rb_counter += 1
 
-        mean_score = float(pred[valid_pred].mean())
-        long_mask = (pred > mean_score) & valid_pred
-        short_mask = (pred <= mean_score) & valid_pred
-        long_idx = np.where(long_mask)[0]
-        short_idx = np.where(short_mask)[0]
         long_firm_ids = ids[long_idx]
         short_firm_ids = ids[short_idx]
 
-        long_w = _capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight)
-        short_w = _capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
-        long_w = _renorm_over_valid(long_w, valid[long_idx])
-        short_w = _renorm_over_valid(short_w, valid[short_idx])
+        # long_idx and short_idx are already restricted to firms with a
+        # valid prediction and a valid realised return, so the capped
+        # softmax weights below sum to one over exactly the firms actually
+        # held, with no separate renormalisation step needed that could
+        # otherwise reintroduce a position above max_position_weight
+        long_w = capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight)
+        short_w = capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
 
-        # compute leg returns and record per-firm realised returns for
-        # the drift accounting at the next rebalance
         long_ids_list = long_firm_ids.tolist()
         short_ids_list = short_firm_ids.tolist()
-        long_realised = {}
-        short_realised = {}
-        long_ret = 0.0
-        for i, fi in enumerate(long_idx):
-            ri = float(r[fi]) if valid[fi] else 0.0
-            long_realised[int(ids[fi])] = ri
-            long_ret += long_w[i] * ri
-        short_ret = 0.0
-        for i, fi in enumerate(short_idx):
-            ri = float(r[fi]) if valid[fi] else 0.0
-            short_realised[int(ids[fi])] = ri
-            short_ret += short_w[i] * ri
+        long_realised = {int(ids[fi]): float(r[fi]) for fi in long_idx}
+        short_realised = {int(ids[fi]): float(r[fi]) for fi in short_idx}
+        long_ret = float(np.dot(long_w, r[long_idx]))
+        short_ret = float(np.dot(short_w, r[short_idx]))
         ls_ret = long_ret - short_ret
 
         # drift previous leg weights and compute L1 turnover
-        d_long_ids, d_long_w = _drift_weights(prev_long_ids, prev_long_w, prev_long_realised)
-        d_short_ids, d_short_w = _drift_weights(prev_short_ids, prev_short_w, prev_short_realised)
-        lt = _weight_l1_turnover(d_long_ids, d_long_w, long_ids_list, long_w)
-        st = _weight_l1_turnover(d_short_ids, d_short_w, short_ids_list, short_w)
+        d_long_ids, d_long_w = drift_weights(prev_long_ids, prev_long_w, prev_long_realised)
+        d_short_ids, d_short_w = drift_weights(prev_short_ids, prev_short_w, prev_short_realised)
+        lt = weight_l1_turnover(d_long_ids, d_long_w, long_ids_list, long_w)
+        st = weight_l1_turnover(d_short_ids, d_short_w, short_ids_list, short_w)
         ls_flat_tc = (lt + st) * tc_bps / 10000.0
 
         ls_period_rets.append(ls_ret)
@@ -501,51 +327,40 @@ def run_mean_split_simulation(predictor, month_dates):
         prev_short_w = short_w
         prev_short_realised = short_realised
 
-        lo_w = _capped_softmax_weights(pred[valid_pred], max_position_weight)
-        lo_w_full = np.zeros(n_firms, dtype=np.float64)
-        lo_w_full[valid_pred] = lo_w
-        lo_w_full = _renorm_over_valid(lo_w_full, valid)
-        lo_firm_ids = ids[valid_pred]
+        lo_firm_ids = ids[lo_idx]
+        lo_w = capped_softmax_weights(pred[lo_idx], max_position_weight)
         lo_ids_list = lo_firm_ids.tolist()
-        lo_realised = {}
-        lo_ret = 0.0
-        for fi in range(n_firms):
-            ri = float(r[fi]) if valid[fi] else 0.0
-            lo_realised[int(ids[fi])] = ri
-            lo_ret += lo_w_full[fi] * ri
+        lo_realised = {int(ids[fi]): float(r[fi]) for fi in lo_idx}
+        lo_ret = float(np.dot(lo_w, r[lo_idx]))
 
-        d_lo_ids, d_lo_w = _drift_weights(prev_lo_ids, prev_lo_w, prev_lo_realised)
-        # the long-only target weights need to be expressed over the same
-        # id space as the drifted previous weights. lo_w is indexed over
-        # valid_pred positions. expand to the full id list for the L1 calc.
-        lo_turn = _weight_l1_turnover(d_lo_ids, d_lo_w, ids.tolist(), lo_w_full)
+        d_lo_ids, d_lo_w = drift_weights(prev_lo_ids, prev_lo_w, prev_lo_realised)
+        lo_turn = weight_l1_turnover(d_lo_ids, d_lo_w, lo_ids_list, lo_w)
         lo_flat_tc = lo_turn * tc_bps / 10000.0
 
         lo_period_rets.append(lo_ret)
         lo_period_dates.append(eom)
         lo_tc_history.append(lo_flat_tc)
-        prev_lo_ids = ids.tolist()
-        prev_lo_w = lo_w_full
+        prev_lo_ids = lo_ids_list
+        prev_lo_w = lo_w
         prev_lo_realised = lo_realised
 
         for i, fi in enumerate(long_idx):
             ls_holdings.append({
                 'rebalance_index': rb_counter, 'eom': eom, 'leg': 'long',
                 'id': int(ids[fi]), 'weight': float(long_w[i]),
-                'realised_return': float(r[fi]) if valid[fi] else float('nan'),
+                'realised_return': float(r[fi]),
             })
         for i, fi in enumerate(short_idx):
             ls_holdings.append({
                 'rebalance_index': rb_counter, 'eom': eom, 'leg': 'short',
                 'id': int(ids[fi]), 'weight': float(-short_w[i]),
-                'realised_return': float(r[fi]) if valid[fi] else float('nan'),
+                'realised_return': float(r[fi]),
             })
-        valid_pred_idx = np.where(valid_pred)[0]
-        for i, fi in enumerate(valid_pred_idx):
+        for i, fi in enumerate(lo_idx):
             lo_holdings.append({
                 'rebalance_index': rb_counter, 'eom': eom, 'leg': 'long',
                 'id': int(ids[fi]), 'weight': float(lo_w[i]),
-                'realised_return': float(r[fi]) if valid[fi] else float('nan'),
+                'realised_return': float(r[fi]),
             })
 
     return {
@@ -569,8 +384,9 @@ def _build_period_rows(model_name, portfolio, scaling, rets, dates):
     if len(rets) == 0:
         return []
     cw = np.cumprod(1.0 + rets)
-    peak = np.maximum.accumulate(cw)
-    dd = (peak - cw) / peak
+    cw_dd = np.maximum(cw, 1e-12)
+    peak = np.maximum.accumulate(np.concatenate(([1.0], cw_dd)))[1:]
+    dd = (peak - cw_dd) / peak
 
     roll_window = 4
     rolling_sharpe = np.full(len(rets), np.nan)
@@ -632,13 +448,6 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
     short_weight_dict = {}
     lo_weight_dict = {}
 
-    prev_long_ids = None
-    prev_long_w = None
-    prev_short_ids = None
-    prev_short_w = None
-    prev_lo_ids = None
-    prev_lo_w = None
-
     for pos, eom in enumerate(month_dates):
         if eom not in all_months:
             continue
@@ -657,45 +466,48 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
 
             if valid_pred.sum() >= min_stocks:
                 mean_score = float(pred[valid_pred].mean())
-                long_mask = (pred > mean_score) & valid_pred
-                short_mask = (pred <= mean_score) & valid_pred
-                long_idx = np.where(long_mask)[0]
-                short_idx = np.where(short_mask)[0]
+                long_idx = np.where((pred > mean_score) & valid_pred)[0]
+                short_idx = np.where((pred <= mean_score) & valid_pred)[0]
+                lo_idx = np.where(valid_pred)[0]
 
-                new_long_ids = ids[long_idx]
-                new_short_ids = ids[short_idx]
-                new_lo_ids = ids[valid_pred]
+                # a mean split gives no guarantee on leg size, so a thin or
+                # empty leg is skipped rather than allowed to collapse into
+                # an uncontrolled single name concentration
+                if len(long_idx) >= min_leg_stocks and len(short_idx) >= min_leg_stocks:
+                    new_long_ids = ids[long_idx]
+                    new_short_ids = ids[short_idx]
+                    new_lo_ids = ids[lo_idx]
 
-                lw = _capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight)
-                sw = _capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
-                low = _capped_softmax_weights(pred[valid_pred], max_position_weight)
+                    lw = capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight)
+                    sw = capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
+                    low = capped_softmax_weights(pred[lo_idx], max_position_weight)
 
-                # snapshot drifted previous weights for L1 turnover before
-                # overwriting with new targets
-                prev_drifted_long_ids = (list(long_weight_dict.keys()) if long_weight_dict else None)
-                prev_drifted_long_w = (list(long_weight_dict.values()) if long_weight_dict else None)
-                prev_drifted_short_ids = (list(short_weight_dict.keys()) if short_weight_dict else None)
-                prev_drifted_short_w = (list(short_weight_dict.values()) if short_weight_dict else None)
-                prev_drifted_lo_ids = (list(lo_weight_dict.keys()) if lo_weight_dict else None)
-                prev_drifted_lo_w = (list(lo_weight_dict.values()) if lo_weight_dict else None)
+                    # snapshot drifted previous weights for L1 turnover before
+                    # overwriting with new targets
+                    prev_drifted_long_ids = (list(long_weight_dict.keys()) if long_weight_dict else None)
+                    prev_drifted_long_w = (list(long_weight_dict.values()) if long_weight_dict else None)
+                    prev_drifted_short_ids = (list(short_weight_dict.keys()) if short_weight_dict else None)
+                    prev_drifted_short_w = (list(short_weight_dict.values()) if short_weight_dict else None)
+                    prev_drifted_lo_ids = (list(lo_weight_dict.keys()) if lo_weight_dict else None)
+                    prev_drifted_lo_w = (list(lo_weight_dict.values()) if lo_weight_dict else None)
 
-                new_long_ids_list = new_long_ids.tolist()
-                new_short_ids_list = new_short_ids.tolist()
-                new_lo_ids_list = new_lo_ids.tolist()
+                    new_long_ids_list = new_long_ids.tolist()
+                    new_short_ids_list = new_short_ids.tolist()
+                    new_lo_ids_list = new_lo_ids.tolist()
 
-                lt = _weight_l1_turnover(prev_drifted_long_ids, prev_drifted_long_w, new_long_ids_list, lw)
-                st = _weight_l1_turnover(prev_drifted_short_ids, prev_drifted_short_w, new_short_ids_list, sw)
-                lo_turn = _weight_l1_turnover(prev_drifted_lo_ids, prev_drifted_lo_w, new_lo_ids_list, low)
+                    lt = weight_l1_turnover(prev_drifted_long_ids, prev_drifted_long_w, new_long_ids_list, lw)
+                    st = weight_l1_turnover(prev_drifted_short_ids, prev_drifted_short_w, new_short_ids_list, sw)
+                    lo_turn = weight_l1_turnover(prev_drifted_lo_ids, prev_drifted_lo_w, new_lo_ids_list, low)
 
-                ls_tc_this = (lt + st) * tc_bps / 10000.0
-                lo_tc_this = lo_turn * tc_bps / 10000.0
+                    ls_tc_this = (lt + st) * tc_bps / 10000.0
+                    lo_tc_this = lo_turn * tc_bps / 10000.0
 
-                long_weight_dict = dict(zip(new_long_ids_list, lw.tolist()))
-                short_weight_dict = dict(zip(new_short_ids_list, sw.tolist()))
-                lo_weight_dict = dict(zip(new_lo_ids_list, low.tolist()))
+                    long_weight_dict = dict(zip(new_long_ids_list, lw.tolist()))
+                    short_weight_dict = dict(zip(new_short_ids_list, sw.tolist()))
+                    lo_weight_dict = dict(zip(new_lo_ids_list, low.tolist()))
 
-                ls_rb_indices.append(len(ls_monthly_rets))
-                lo_rb_indices.append(len(lo_monthly_rets))
+                    ls_rb_indices.append(len(ls_monthly_rets))
+                    lo_rb_indices.append(len(lo_monthly_rets))
 
         if not long_weight_dict:
             continue
@@ -741,34 +553,14 @@ def run_mean_split_simulation_monthly(predictor, month_dates):
     }
 
 
-def apply_vol_target_monthly(monthly_rets, rebalance_indices, lookback_months, max_lev):
-    monthly_rets = np.asarray(monthly_rets, dtype=np.float64)
-    n = len(monthly_rets)
-    leverage = np.ones(n, dtype=np.float64)
-    n_rb = len(rebalance_indices)
-    for i in range(n_rb):
-        rb_idx = rebalance_indices[i]
-        start = max(0, rb_idx - lookback_months)
-        trailing = monthly_rets[start:rb_idx]
-        if len(trailing) < lookback_months:
-            continue
-        sigma_ann = float(trailing.std() * np.sqrt(12.0))
-        lev = float(np.clip(
-            target_vol / max(sigma_ann, 1e-8),
-            1.0 / max_lev, max_lev,
-        ))
-        next_rb = rebalance_indices[i + 1] if i + 1 < n_rb else n
-        leverage[rb_idx:next_rb] = lev
-    return leverage
-
-
 def _build_monthly_rows(model_name, portfolio, scaling, rets, dates):
     rets = np.asarray(rets, dtype=np.float64)
     if len(rets) == 0:
         return []
     cw = np.cumprod(1.0 + rets)
-    peak = np.maximum.accumulate(cw)
-    dd = (peak - cw) / peak
+    cw_dd = np.maximum(cw, 1e-12)
+    peak = np.maximum.accumulate(np.concatenate(([1.0], cw_dd)))[1:]
+    dd = (peak - cw_dd) / peak
 
     rolling_sharpe = np.full(len(rets), np.nan)
     rolling_ret = np.full(len(rets), np.nan)
@@ -800,23 +592,6 @@ def _build_monthly_rows(model_name, portfolio, scaling, rets, dates):
             ),
         })
     return rows
-
-
-def rank_correlation_oos(predictor, month_dates):
-    corrs = []
-    for eom in month_dates:
-        if eom not in all_months:
-            continue
-        m = all_months[eom]
-        pred = predictor.predict(m['x'])
-        valid = np.isfinite(pred) & np.isfinite(m['r'])
-        if valid.sum() < 10:
-            continue
-        result = spearmanr(pred[valid], m['r'][valid])
-        c = result.statistic                                          # pyright: ignore[reportAttributeAccessIssue]
-        if not np.isnan(c):
-            corrs.append(float(c))                              
-    return float(np.mean(corrs)) if corrs else 0.0
 
 
 # training
@@ -872,7 +647,7 @@ def train_mlp(params, x_pool, y_pool, val_dates_local, n_epochs, patience_val, d
         train_losses.append(avg_loss)
 
         if early_stop:
-            val_rc = rank_correlation_oos(predictor, val_dates_local)
+            val_rc = rank_correlation_oos(predictor.predict, val_dates_local, all_months)
             val_rank_corrs.append(val_rc)
             if val_rc > best_rc:
                 best_rc = val_rc
@@ -947,11 +722,16 @@ else:
         if len(ls['returns']) == 0:
             return -999.0
         ls_scaled, _, _ = apply_overlay_and_costs(
-            ls['returns'], ls['tc'], n_vol_periods, periods_per_year, max_leverage_long_short)
+            ls['returns'], ls['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_short)
         lo_scaled, _, _ = apply_overlay_and_costs(
-            lo['returns'], lo['tc'], n_vol_periods, periods_per_year, max_leverage_long_only)
+            lo['returns'], lo['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_only)
         ls_sharpe = portfolio_metrics(ls_scaled, periods_per_year).get('sharpe', -999.0)
         lo_sharpe = portfolio_metrics(lo_scaled, periods_per_year).get('sharpe', -999.0)
+
+        if not np.isfinite(ls_sharpe):
+            ls_sharpe = -999.0
+        if not np.isfinite(lo_sharpe):
+            lo_sharpe = -999.0
         trial.set_user_attr('best_epoch', int(log['best_epoch']))
         trial.set_user_attr('n_epochs_run', int(log['n_epochs_run']))
         trial.set_user_attr('best_val_rc', float(log['best_val_rc']))
@@ -1026,8 +806,8 @@ with open(results_dir / 'mlp_train_log.json', 'w') as mlps:
     }, mlps, indent=2, default=float)
 
 
-mlp_rc_val = rank_correlation_oos(mlp_predictor, val_dates)
-mlp_rc_test = rank_correlation_oos(mlp_predictor, test_dates)
+mlp_rc_val = rank_correlation_oos(mlp_predictor.predict, val_dates, all_months)
+mlp_rc_test = rank_correlation_oos(mlp_predictor.predict, test_dates, all_months)
 print(f'mlp rank corr: val = {mlp_rc_val:.4f}, test = {mlp_rc_test:.4f}')
 
 # test set evaluation. the simulation runs on all sorted_dates so the
@@ -1040,9 +820,9 @@ def evaluate_and_save(predictor, name):
     lo = sim['long_only']
 
     ls_scaled_full, ls_unscaled_full, ls_lev = apply_overlay_and_costs(
-        ls['returns'], ls['tc'], n_vol_periods, periods_per_year, max_leverage_long_short)
+        ls['returns'], ls['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_short)
     lo_scaled_full, lo_unscaled_full, lo_lev = apply_overlay_and_costs(
-        lo['returns'], lo['tc'], n_vol_periods, periods_per_year, max_leverage_long_only)
+        lo['returns'], lo['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_only)
 
     test_set = set(test_dates)
     ls_mask = np.array([d in test_set for d in ls['dates']])
@@ -1077,7 +857,7 @@ def evaluate_and_save(predictor, name):
     ls_hold_df.to_csv(results_dir / f'{name}_holdings_long_short.csv', index=False)
     lo_hold_df.to_csv(results_dir / f'{name}_holdings_long_only.csv', index=False)
 
-    predict_at_dates(predictor, test_dates).to_csv(
+    predict_at_dates(predictor.predict, test_dates, all_months).to_csv(
         results_dir / f'{name}_test_predictions.csv', index=False,
     )
 
@@ -1146,9 +926,11 @@ summary = {
         'horizon_months': horizon_months,
         'tc_bps': tc_bps,
         'min_stocks': min_stocks,
+        'min_leg_stocks': min_leg_stocks,
         'ret_clip': [ret_clip_low, ret_clip_high],
         'target_vol': target_vol,
         'vol_lookback_months': vol_lookback_months,
+        'vol_lookback_periods': vol_lookback_periods,
         'n_vol_periods': n_vol_periods,
         'periods_per_year': periods_per_year,
         'max_leverage_long_only': max_leverage_long_only,
@@ -1214,6 +996,7 @@ for portfolio, scaling, key in [
         'se': _round_or_none(m['se_sharpe'], 4),
         'ann_ret': _round_or_none(m['ann_ret'] * 100, 2),
         'ann_vol': _round_or_none(m['ann_vol'] * 100, 2),
+        'cagr': _round_or_none(m['cagr'] * 100, 2),
         'cum_return': _round_or_none(m['cum_return'] * 100, 2),
         'max_dd': _round_or_none(m['max_dd'] * 100, 2),
         'n_obs': m['n_obs'],
@@ -1283,8 +1066,8 @@ mo_sim = run_mean_split_simulation_monthly(mlp_predictor, sorted_dates)
 mo_ls = mo_sim['long_short']
 mo_lo = mo_sim['long_only']
 
-mo_ls_lev = apply_vol_target_monthly(mo_ls['returns'] - mo_ls['tc'], mo_ls['rb_indices'], vol_lookback_months, max_leverage_long_short)
-mo_lo_lev = apply_vol_target_monthly(mo_lo['returns'] - mo_lo['tc'], mo_lo['rb_indices'], vol_lookback_months, max_leverage_long_only)
+mo_ls_lev = apply_vol_target_monthly(mo_ls['returns'] - mo_ls['tc'], mo_ls['rb_indices'], target_vol, vol_lookback_months, max_leverage_long_short)
+mo_lo_lev = apply_vol_target_monthly(mo_lo['returns'] - mo_lo['tc'], mo_lo['rb_indices'], target_vol, vol_lookback_months, max_leverage_long_only)
 
 mo_ls_unscaled_full = mo_ls['returns'] - mo_ls['tc']
 mo_ls_scaled_full = mo_ls_lev * mo_ls['returns'] - mo_ls_lev * mo_ls['tc']
@@ -1327,65 +1110,3 @@ for portfolio, scaling, rets, dates in [
 per_month_df = pd.DataFrame(monthly_rows)
 per_month_df.to_csv(results_dir / 'mlp_per_month_metrics.csv', index=False)
 print(f'per month metrics saved, {len(per_month_df)} rows')
-
-
-# plots
-mlp_color = 'darkgreen'
-xlabel_periods = f'Rebalance periods from start of test window ({rebalance_freq} months each)'
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-ax = axes[0]
-ax.plot(np.cumprod(1 + mlp_eval['returns_ls_scaled']), label='MLP, Scaled', color=mlp_color)
-ax.plot(np.cumprod(1 + mlp_eval['returns_ls_unscaled']), label='MLP, Unscaled', color=mlp_color, linestyle='--')
-ax.set_xlabel(xlabel_periods)
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Long Short, Scaled and Unscaled')
-ax.legend(frameon=False)
-ax.grid(alpha=0.3)
-
-ax = axes[1]
-ax.plot(np.cumprod(1 + mlp_eval['returns_lo_scaled']), label='MLP, Scaled', color=mlp_color)
-ax.plot(np.cumprod(1 + mlp_eval['returns_lo_unscaled']), label='MLP, Unscaled', color=mlp_color, linestyle='--')
-ax.set_xlabel(xlabel_periods)
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Long Only, Scaled and Unscaled')
-ax.legend(frameon=False)
-ax.grid(alpha=0.3)
-fig.tight_layout()
-plt.show()
-
-
-
-fig, axes = plt.subplots(1, 3, figsize=(18, 4))
-
-axes[0].plot(mlp_log['train_losses'], color='steelblue')
-axes[0].set_xlabel('Epoch (final training pass)')
-axes[0].set_ylabel('MSE')
-axes[0].set_title('Training Loss')
-axes[0].grid(alpha=0.3)
-
-if mlp_study is not None:
-    mlp_vals = [t.value for t in mlp_study.trials if t.value is not None]
-    axes[1].plot(np.maximum.accumulate(mlp_vals), color=mlp_color)
-    axes[1].scatter(range(len(mlp_vals)), mlp_vals, alpha=0.3, s=15, color=mlp_color)
-    axes[1].set_xlabel('Trial')
-    axes[1].set_ylabel('Validation LS Sharpe')
-    axes[1].set_title('MLP Optuna Search')
-    axes[1].grid(alpha=0.3)
-else:
-    axes[1].text(0.5, 0.5, 'study not in memory', ha='center', va='center')
-    axes[1].set_title('MLP Optuna Search')
-
-ls_unscaled = mlp_eval['returns_ls_unscaled']
-ls_scaled = mlp_eval['returns_ls_scaled']
-axes[2].bar(range(len(ls_unscaled)), ls_unscaled, alpha=0.5, color=mlp_color, label='Unscaled')
-axes[2].bar(range(len(ls_scaled)), ls_scaled, alpha=0.5, color='darkorange', label='Scaled')
-axes[2].axhline(0, color='black', linewidth=0.8)
-axes[2].set_xlabel(xlabel_periods)
-axes[2].set_ylabel('Period Return')
-axes[2].set_title('Long Short Period Returns')
-axes[2].legend(frameon=False)
-axes[2].grid(alpha=0.3)
-
-fig.tight_layout()
-plt.show()
