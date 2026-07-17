@@ -1,5 +1,5 @@
 model,portfolio,scaling,eom,return,cumulative_wealth,drawdown,rolling_sharpe_12m,rolling_ann_ret_12m
-mlp,long_short,unscaled,2021-01-31,-0.000215,0.999785,0.0,,
+mlp,long_short,unscaled,2021-01-31,-0.000215,0.999785,0.000215,,
 mlp,long_short,unscaled,2021-02-28,0.01851,1.018291,0.0,,
 mlp,long_short,unscaled,2021-03-31,0.014431,1.032986,0.0,,
 mlp,long_short,unscaled,2021-04-30,0.023855,1.057628,0.0,,
@@ -54,7 +54,7 @@ mlp,long_short,unscaled,2025-04-30,0.001243,1.42263,0.018304,1.0616,5.7382
 mlp,long_short,unscaled,2025-05-31,0.006143,1.431369,0.012273,0.9509,5.0828
 mlp,long_short,unscaled,2025-06-30,0.01122,1.447429,0.001191,1.3191,6.9163
 mlp,long_short,unscaled,2025-07-31,0.018746,1.474563,0.0,1.5571,8.381
-mlp,long_short,scaled,2021-01-31,-0.000583,0.999417,0.0,,
+mlp,long_short,scaled,2021-01-31,-0.000583,0.999417,0.000583,,
 mlp,long_short,scaled,2021-02-28,0.050171,1.049559,0.0,,
 mlp,long_short,scaled,2021-03-31,0.039114,1.090611,0.0,,
 mlp,long_short,scaled,2021-04-30,0.064657,1.161126,0.0,,

@@ -10,11 +10,11 @@
     "reg_alpha": 1.459699856402196,
     "reg_lambda": 0.30524535962176974
   },
-  "best_value": 2.221704355756333,
+  "best_value": 2.221704355756334,
   "best_trial_number": 47,
   "best_trial_user_attrs": {
-    "val_sharpe_long_only": 0.6307301233669025
+    "val_sharpe_long_only": 0.630730123366906
   },
   "n_trials_completed": 50,
-  "hpo_time_seconds": 1096.5247066020966
+  "hpo_time_seconds": 864.8280205726624
 }
