@@ -6,6 +6,6 @@
   ],
   "best_epoch_from_hpo": 2,
   "n_final_epochs": 3,
-  "training_time_seconds": 9.779619216918945,
+  "training_time_seconds": 9.931578159332275,
   "parameter_count": 730113
 }

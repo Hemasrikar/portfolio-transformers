@@ -1,26 +1,21 @@
-import gc
 import json
 import time
-import pickle
 import warnings
 from pathlib import Path
 
-import pyarrow as pa
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import optuna
 from safetensors.torch import save_file as safetensors_save
-import matplotlib.pyplot as plt
 
 from benchmark_common import (
-    portfolio_metrics, capped_softmax_weights,
-    mean_split_legs, long_only_leg,
-    weight_l1_turnover, drift_weights,
-    apply_overlay_and_costs, apply_vol_target_monthly,
-    predict_at_dates, rank_correlation_oos
+	BenchmarkConfig, load_universe, make_splits, stack_months,
+	validation_sharpes, evaluate_and_save, hpo_run_or_load,
+	run_mean_split_simulation_monthly, apply_vol_target_monthly,
+	build_diagnostic_rows, portfolio_metrics, rank_correlation_oos,
+	round_or_none, strip_per_year, flush_per_year_rows,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -30,763 +25,171 @@ warnings.filterwarnings('ignore')
 cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if cuda_available else 'cpu')
 print(f'cuda available: {cuda_available}, device: {device}')
-print(f'device name: {torch.cuda.get_device_name(0)}')
+if cuda_available:
+	print(f'device name: {torch.cuda.get_device_name(0)}')
 
-
-# configuration
 
 data_path = Path('data/Global Factor_EM.parquet')
 results_dir = Path('results/benchmark/mlp_benchmark')
-results_dir.mkdir(parents=True, exist_ok=True)
+results_dir.mkdir(parents = True, exist_ok = True)
 
 train_end = pd.Timestamp('2015-12-31')
 val_end = pd.Timestamp('2020-12-31')
-
 ret_col_1m = 'ret_exc_lead1m'
 ret_col = 'ret_exc_lead6m'
 
-rebalance_freq = 6
-horizon_months = 6
-tc_bps = 25
-min_stocks = 30
-min_leg_stocks = 10
-ret_clip_low = -1.0
-ret_clip_high = 1.0
-
-target_vol = 0.10
-# vol_lookback_months drives the monthly resolution overlay, used only for
-# the monthly diagnostic simulation, which has 36 individual monthly return
-# observations to estimate trailing volatility from. vol_lookback_periods
-# drives the period resolution overlay, used for the headline summary
-# metrics, which only has this many six month rebalance period returns to
-# estimate trailing volatility from. the two are intentionally different
-# estimators over different sample sizes and are kept as separate constants
-# rather than one being derived from the other
-vol_lookback_months = 36
-vol_lookback_periods = 6
-max_leverage_long_only = 3.0
-max_leverage_long_short = 3.0
-max_position_weight = 0.05
+cfg = BenchmarkConfig()
 
 n_epochs_hpo = 100
 patience = 10
 grad_clip_norm = 1.0
-
 n_trials = 30
 optuna_seed = 24
 torch_seed = 24
 
-periods_per_year = 12.0 / rebalance_freq
-n_vol_periods = vol_lookback_periods
 
-
-
-schema = pq.read_schema(data_path)
-
-non_feature = {
-    # identifiers
-    'id', 'gvkey', 'iid', 'isin', 'cusip', 'permno', 'permco',
-    # dates, country, currency, size grouping
-    'eom', 'date', 'excntry', 'curcd', 'size_grp',
-    # the prediction target column at the one month horizon, retained here so
-    # the cumulative six month target can be constructed below
-    ret_col_1m,
-    # industry classification codes encoded as float
-    'sic', 'naics', 'gics', 'ff49',
-    # exchange and share classification codes
-    'comp_tpci', 'crsp_shrcd', 'comp_exchg', 'crsp_exchcd',
-    # filter and quality indicators, all encoded as float
-    'obs_main', 'exch_main', 'primary_sec', 'common', 'bidask',
-    'source_crsp',
-    # return calculation metadata
-    'adjfct', 'fx', 'ret_lag_dif',
-    # raw same period returns, redundant with ret_1_0 short term reversal characteristic
-    'ret', 'ret_exc', 'ret_local',
-    # level forms of characteristics, redundant with the ranked characteristics
-    'me', 'me_company', 'prc', 'prc_local', 'prc_high', 'prc_low',
-    'dolvol', 'shares', 'tvol',
-}
-feature_cols = [
-    c for c in schema.names
-    if c not in non_feature
-    and pa.types.is_floating(schema.field(c).type)
-    and '_lag' not in c
-]
-
-print(f'feature columns selected: {len(feature_cols)}')
-
-needed = list(dict.fromkeys(
-    [c for c in ['id', 'eom', 'excntry', ret_col_1m] + feature_cols
-     if c in schema.names]
-))
-
-table = pq.read_table(data_path, columns=needed)
-cast_fields = []
-for field in table.schema:
-    if field.name in feature_cols and pa.types.is_float64(field.type):
-        cast_fields.append(field.with_type(pa.float32()))
-    else:
-        cast_fields.append(field)
-table = table.cast(pa.schema(cast_fields))
-
-df = table.to_pandas()
-del table
-gc.collect()
-df['eom'] = pd.to_datetime(df['eom'])
-
-df[ret_col_1m] = df[ret_col_1m].clip(lower=ret_clip_low, upper=ret_clip_high)
-
-print(f'loaded: {df.shape[0]:,} rows, {len(feature_cols)} characteristic columns')
-print(f'date range: {df["eom"].min().date()} to {df["eom"].max().date()}')
-
-
-# six month cumulative forward target. for each firm and month we compound
-# the next six one month forward returns. the block must be complete. any
-# firm month with a gap in the forward window is dropped for that month.
-
-df = df.sort_values(['id', 'eom']).reset_index(drop=True)
-
-shifted = []
-for k in range(horizon_months):
-    s = df.groupby('id', sort=False)[ret_col_1m].shift(-k)
-    shifted.append(s.to_numpy(dtype=np.float64))
-
-shifted = np.stack(shifted, axis=1)
-valid_block = np.isfinite(shifted).all(axis=1)
-
-cum = np.where(
-    valid_block,
-    np.prod(1.0 + shifted, axis=1) - 1.0,
-    np.nan,
-)
-df[ret_col] = cum.astype(np.float32)
-df[ret_col] = df[ret_col].clip(lower=ret_clip_low * 2.0, upper=ret_clip_high * 2.0)
-
-retained = int(np.isfinite(cum).sum())
-print(f'cumulative six month target: {retained:,} of {len(df):,} rows retained')
-print(f'  retention rate: {100.0 * retained / len(df):.2f}%')
-
-del shifted
-gc.collect()
-
-
-# per month preprocessing: rank normalise each characteristic to the unit
-# interval, centre at zero, impute missing to zero (the cross sectional
-# median after centering). matches tree_benchmark.py exactly.
-
-sorted_eoms = sorted(df['eom'].unique())
-all_months = {}
-n_feat = len(feature_cols)
-
-for eom in sorted_eoms:
-    month = df[df['eom'] == eom].copy()
-    month = month[month[ret_col].notna()]
-    if len(month) < min_stocks:
-        continue
-    ids = month['id'].to_numpy()
-    r = month[ret_col].to_numpy().astype(np.float64)
-    x = np.zeros((len(month), n_feat), dtype=np.float32)
-    for j, col in enumerate(feature_cols):
-        if col not in month.columns:
-            continue
-        vals = month[col].astype(np.float64).to_numpy()
-        valid = np.isfinite(vals)
-        if valid.sum() > 1:
-            ranks = pd.Series(vals[valid]).rank(pct=True).to_numpy(dtype=np.float32)
-            x[valid, j] = ranks - 0.5
-    r1m = month[ret_col_1m].to_numpy().astype(np.float64)
-    all_months[eom] = {'ids': ids, 'r': r, 'r1m': r1m, 'x': x}
-
-sorted_dates = sorted(all_months.keys())
-print(f'processed: {len(sorted_dates)} months')
-print(f'avg firms per month: {np.mean([len(m["ids"]) for m in all_months.values()]):.0f}')
-
-
-# train, validation, and test splits
-
-train_dates = [d for d in sorted_dates if d <= train_end]
-val_dates = [d for d in sorted_dates if train_end < d <= val_end]
-test_dates = [d for d in sorted_dates if d > val_end]
-
-x_train = np.vstack([all_months[d]['x'] for d in train_dates])
-y_train = np.concatenate([all_months[d]['r'] for d in train_dates]).astype(np.float32)
-
+feature_cols, all_months, sorted_dates = load_universe(data_path, ret_col_1m, ret_col, cfg, store_r1m = True)
+train_dates, val_dates, test_dates = make_splits(sorted_dates, train_end, val_end)
 print(f'train: {len(train_dates)} months, val: {len(val_dates)} months, test: {len(test_dates)} months')
+
+x_train, y_train = stack_months(all_months, train_dates)
+y_train = y_train.astype(np.float32)
 print(f'x_train: {x_train.shape}')
 
 
 # model
 
 class MLP(nn.Module):
-    def __init__(self, n_features, d_model, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, d_model), nn.ELU(), nn.Dropout(dropout),
-            nn.Linear(d_model, d_model), nn.ELU(), nn.Dropout(dropout),
-            nn.Linear(d_model, d_model), nn.ELU(), nn.Dropout(dropout),
-            nn.Linear(d_model, 1),
-        )
+	def __init__(self, n_features, d_model, dropout):
+		super().__init__()
+		self.net = nn.Sequential(
+			nn.Linear(n_features, d_model), nn.ELU(), nn.Dropout(dropout),
+			nn.Linear(d_model, d_model), nn.ELU(), nn.Dropout(dropout),
+			nn.Linear(d_model, d_model), nn.ELU(), nn.Dropout(dropout),
+			nn.Linear(d_model, 1),
+		)
 
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
+	def forward(self, x):
+		return self.net(x).squeeze(-1)
 
 
 class MLPPredictor:
-    def __init__(self, model, dev):
-        self.model = model
-        self.dev = dev
-
-    def predict(self, x):
-        self.model.eval()
-        with torch.no_grad():
-            x_t = torch.from_numpy(x).float().to(self.dev)
-            return self.model(x_t).cpu().numpy()
-
-
-def run_mean_split_simulation(predictor, month_dates):
-    ls_period_rets, ls_period_dates = [], []
-    ls_tc_history = []
-    lo_period_rets, lo_period_dates = [], []
-    lo_tc_history = []
-
-    # state for drift-based turnover accounting per leg
-    prev_long_ids = None
-    prev_long_w = None
-    prev_long_realised = None
-    prev_short_ids = None
-    prev_short_w = None
-    prev_short_realised = None
-    prev_lo_ids = None
-    prev_lo_w = None
-    prev_lo_realised = None
-
-    ls_holdings, lo_holdings = [], []
-    rb_counter = -1
-
-    for pos, eom in enumerate(month_dates):
-        if pos % rebalance_freq != 0:
-            continue
-        if eom not in all_months:
-            continue
-        m = all_months[eom]
-        ids = m['ids']
-        r = m['r']
-        x = m['x']
-
-        n_firms = len(ids)
-        if n_firms < min_stocks:
-            continue
-
-        pred = predictor.predict(x)
-        valid_pred = np.isfinite(pred)
-        if valid_pred.sum() < min_stocks:
-            continue
-
-        valid_ret = np.isfinite(r)
-
-        legs = mean_split_legs(pred, valid_pred, valid_ret, min_leg_stocks)
-        lo_idx = long_only_leg(valid_pred, valid_ret, min_leg_stocks)
-        if legs is None or lo_idx is None:
-            continue
-        mean_score, long_idx, short_idx = legs
-        rb_counter += 1
-
-        long_firm_ids = ids[long_idx]
-        short_firm_ids = ids[short_idx]
-
-        # long_idx and short_idx are already restricted to firms with a
-        # valid prediction and a valid realised return, so the capped
-        # softmax weights below sum to one over exactly the firms actually
-        # held, with no separate renormalisation step needed that could
-        # otherwise reintroduce a position above max_position_weight
-        long_w = capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight)
-        short_w = capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
-
-        long_ids_list = long_firm_ids.tolist()
-        short_ids_list = short_firm_ids.tolist()
-        long_realised = {int(ids[fi]): float(r[fi]) for fi in long_idx}
-        short_realised = {int(ids[fi]): float(r[fi]) for fi in short_idx}
-        long_ret = float(np.dot(long_w, r[long_idx]))
-        short_ret = float(np.dot(short_w, r[short_idx]))
-        ls_ret = long_ret - short_ret
-
-        # drift previous leg weights and compute L1 turnover
-        d_long_ids, d_long_w = drift_weights(prev_long_ids, prev_long_w, prev_long_realised)
-        d_short_ids, d_short_w = drift_weights(prev_short_ids, prev_short_w, prev_short_realised)
-        lt = weight_l1_turnover(d_long_ids, d_long_w, long_ids_list, long_w)
-        st = weight_l1_turnover(d_short_ids, d_short_w, short_ids_list, short_w)
-        ls_flat_tc = (lt + st) * tc_bps / 10000.0
-
-        ls_period_rets.append(ls_ret)
-        ls_period_dates.append(eom)
-        ls_tc_history.append(ls_flat_tc)
-        prev_long_ids = long_ids_list
-        prev_long_w = long_w
-        prev_long_realised = long_realised
-        prev_short_ids = short_ids_list
-        prev_short_w = short_w
-        prev_short_realised = short_realised
-
-        lo_firm_ids = ids[lo_idx]
-        lo_w = capped_softmax_weights(pred[lo_idx], max_position_weight)
-        lo_ids_list = lo_firm_ids.tolist()
-        lo_realised = {int(ids[fi]): float(r[fi]) for fi in lo_idx}
-        lo_ret = float(np.dot(lo_w, r[lo_idx]))
-
-        d_lo_ids, d_lo_w = drift_weights(prev_lo_ids, prev_lo_w, prev_lo_realised)
-        lo_turn = weight_l1_turnover(d_lo_ids, d_lo_w, lo_ids_list, lo_w)
-        lo_flat_tc = lo_turn * tc_bps / 10000.0
-
-        lo_period_rets.append(lo_ret)
-        lo_period_dates.append(eom)
-        lo_tc_history.append(lo_flat_tc)
-        prev_lo_ids = lo_ids_list
-        prev_lo_w = lo_w
-        prev_lo_realised = lo_realised
-
-        for i, fi in enumerate(long_idx):
-            ls_holdings.append({
-                'rebalance_index': rb_counter, 'eom': eom, 'leg': 'long',
-                'id': int(ids[fi]), 'weight': float(long_w[i]),
-                'realised_return': float(r[fi]),
-            })
-        for i, fi in enumerate(short_idx):
-            ls_holdings.append({
-                'rebalance_index': rb_counter, 'eom': eom, 'leg': 'short',
-                'id': int(ids[fi]), 'weight': float(-short_w[i]),
-                'realised_return': float(r[fi]),
-            })
-        for i, fi in enumerate(lo_idx):
-            lo_holdings.append({
-                'rebalance_index': rb_counter, 'eom': eom, 'leg': 'long',
-                'id': int(ids[fi]), 'weight': float(lo_w[i]),
-                'realised_return': float(r[fi]),
-            })
-
-    return {
-        'long_short': {
-            'returns': np.array(ls_period_rets),
-            'tc': np.array(ls_tc_history),
-            'dates': ls_period_dates,
-            'holdings_df': pd.DataFrame(ls_holdings),
-        },
-        'long_only': {
-            'returns': np.array(lo_period_rets),
-            'tc': np.array(lo_tc_history),
-            'dates': lo_period_dates,
-            'holdings_df': pd.DataFrame(lo_holdings),
-        },
-    }
-
-
-def _build_period_rows(model_name, portfolio, scaling, rets, dates):
-    rets = np.asarray(rets, dtype=np.float64)
-    if len(rets) == 0:
-        return []
-    cw = np.cumprod(1.0 + rets)
-    cw_dd = np.maximum(cw, 1e-12)
-    peak = np.maximum.accumulate(np.concatenate(([1.0], cw_dd)))[1:]
-    dd = (peak - cw_dd) / peak
-
-    roll_window = 4
-    rolling_sharpe = np.full(len(rets), np.nan)
-    rolling_ret = np.full(len(rets), np.nan)
-    for i in range(roll_window - 1, len(rets)):
-        w = rets[i - roll_window + 1:i + 1]
-        mu = float(w.mean() * periods_per_year)
-        sigma = float(w.std() * np.sqrt(periods_per_year))
-        rolling_ret[i] = mu
-        if sigma > 1e-12:
-            rolling_sharpe[i] = mu / sigma
-
-    rows = []
-    for i, eom in enumerate(dates):
-        rows.append({
-            'model': model_name,
-            'portfolio': portfolio,
-            'scaling': scaling,
-            'eom': pd.Timestamp(eom).strftime('%Y-%m-%d'),
-            'return': round(float(rets[i]), 6),
-            'cumulative_wealth': round(float(cw[i]), 6),
-            'drawdown': round(float(dd[i]), 6),
-            'rolling_sharpe_4p': (
-                None if np.isnan(rolling_sharpe[i])
-                else round(float(rolling_sharpe[i]), 4)
-            ),
-            'rolling_ann_ret_4p': (
-                None if np.isnan(rolling_ret[i])
-                else round(float(rolling_ret[i]) * 100, 4)
-            ),
-        })
-    return rows
-
-
-def _drift_weight_dict(weight_dict, id_to_r1m):
-    growth = {}
-    for fid, w in weight_dict.items():
-        r = id_to_r1m.get(fid, 0.0)
-        growth[fid] = w * (1.0 + r)
-    g_sum = sum(growth.values())
-    if g_sum > 1e-12:
-        return {fid: v / g_sum for fid, v in growth.items()}
-    return growth
-
-
-def _weighted_return_from_dict(weight_dict, id_to_r1m):
-    ret = 0.0
-    for fid, w in weight_dict.items():
-        r = id_to_r1m.get(fid, 0.0)
-        ret += w * r
-    return ret
-
-
-def run_mean_split_simulation_monthly(predictor, month_dates):
-    ls_monthly_rets, ls_monthly_tc, ls_monthly_dates, ls_rb_indices = [], [], [], []
-    lo_monthly_rets, lo_monthly_tc, lo_monthly_dates, lo_rb_indices = [], [], [], []
-
-    long_weight_dict = {}
-    short_weight_dict = {}
-    lo_weight_dict = {}
-
-    for pos, eom in enumerate(month_dates):
-        if eom not in all_months:
-            continue
-        m = all_months[eom]
-        ids = m['ids']
-        r1m = m['r1m']
-        valid_r1m = np.isfinite(r1m)
-
-        ls_tc_this = 0.0
-        lo_tc_this = 0.0
-
-        if pos % rebalance_freq == 0:
-            x = m['x']
-            pred = predictor.predict(x)
-            valid_pred = np.isfinite(pred)
-
-            if valid_pred.sum() >= min_stocks:
-                mean_score = float(pred[valid_pred].mean())
-                long_idx = np.where((pred > mean_score) & valid_pred)[0]
-                short_idx = np.where((pred <= mean_score) & valid_pred)[0]
-                lo_idx = np.where(valid_pred)[0]
-
-                # a mean split gives no guarantee on leg size, so a thin or
-                # empty leg is skipped rather than allowed to collapse into
-                # an uncontrolled single name concentration
-                if len(long_idx) >= min_leg_stocks and len(short_idx) >= min_leg_stocks:
-                    new_long_ids = ids[long_idx]
-                    new_short_ids = ids[short_idx]
-                    new_lo_ids = ids[lo_idx]
-
-                    lw = capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight)
-                    sw = capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
-                    low = capped_softmax_weights(pred[lo_idx], max_position_weight)
-
-                    # snapshot drifted previous weights for L1 turnover before
-                    # overwriting with new targets
-                    prev_drifted_long_ids = (list(long_weight_dict.keys()) if long_weight_dict else None)
-                    prev_drifted_long_w = (list(long_weight_dict.values()) if long_weight_dict else None)
-                    prev_drifted_short_ids = (list(short_weight_dict.keys()) if short_weight_dict else None)
-                    prev_drifted_short_w = (list(short_weight_dict.values()) if short_weight_dict else None)
-                    prev_drifted_lo_ids = (list(lo_weight_dict.keys()) if lo_weight_dict else None)
-                    prev_drifted_lo_w = (list(lo_weight_dict.values()) if lo_weight_dict else None)
-
-                    new_long_ids_list = new_long_ids.tolist()
-                    new_short_ids_list = new_short_ids.tolist()
-                    new_lo_ids_list = new_lo_ids.tolist()
-
-                    lt = weight_l1_turnover(prev_drifted_long_ids, prev_drifted_long_w, new_long_ids_list, lw)
-                    st = weight_l1_turnover(prev_drifted_short_ids, prev_drifted_short_w, new_short_ids_list, sw)
-                    lo_turn = weight_l1_turnover(prev_drifted_lo_ids, prev_drifted_lo_w, new_lo_ids_list, low)
-
-                    ls_tc_this = (lt + st) * tc_bps / 10000.0
-                    lo_tc_this = lo_turn * tc_bps / 10000.0
-
-                    long_weight_dict = dict(zip(new_long_ids_list, lw.tolist()))
-                    short_weight_dict = dict(zip(new_short_ids_list, sw.tolist()))
-                    lo_weight_dict = dict(zip(new_lo_ids_list, low.tolist()))
-
-                    ls_rb_indices.append(len(ls_monthly_rets))
-                    lo_rb_indices.append(len(lo_monthly_rets))
-
-        if not long_weight_dict:
-            continue
-
-        id_to_r1m = {
-            int(fid): float(r1m[k])
-            for k, fid in enumerate(ids.tolist())
-            if valid_r1m[k]
-        }
-
-        long_ret = _weighted_return_from_dict(long_weight_dict, id_to_r1m)
-        short_ret = _weighted_return_from_dict(short_weight_dict, id_to_r1m)
-        lo_ret = _weighted_return_from_dict(lo_weight_dict, id_to_r1m)
-
-        ls_monthly_rets.append(long_ret - short_ret)
-        ls_monthly_tc.append(ls_tc_this)
-        ls_monthly_dates.append(eom)
-
-        lo_monthly_rets.append(lo_ret)
-        lo_monthly_tc.append(lo_tc_this)
-        lo_monthly_dates.append(eom)
-
-        # drift weights forward by this month's realised returns so the
-        # next month uses buy-and-hold weights rather than the original
-        # target weights
-        long_weight_dict = _drift_weight_dict(long_weight_dict, id_to_r1m)
-        short_weight_dict = _drift_weight_dict(short_weight_dict, id_to_r1m)
-        lo_weight_dict = _drift_weight_dict(lo_weight_dict, id_to_r1m)
-
-    return {
-        'long_short': {
-            'returns': np.array(ls_monthly_rets),
-            'tc': np.array(ls_monthly_tc),
-            'dates': ls_monthly_dates,
-            'rb_indices': ls_rb_indices,
-        },
-        'long_only': {
-            'returns': np.array(lo_monthly_rets),
-            'tc': np.array(lo_monthly_tc),
-            'dates': lo_monthly_dates,
-            'rb_indices': lo_rb_indices,
-        },
-    }
-
-
-def _build_monthly_rows(model_name, portfolio, scaling, rets, dates):
-    rets = np.asarray(rets, dtype=np.float64)
-    if len(rets) == 0:
-        return []
-    cw = np.cumprod(1.0 + rets)
-    cw_dd = np.maximum(cw, 1e-12)
-    peak = np.maximum.accumulate(np.concatenate(([1.0], cw_dd)))[1:]
-    dd = (peak - cw_dd) / peak
-
-    rolling_sharpe = np.full(len(rets), np.nan)
-    rolling_ret = np.full(len(rets), np.nan)
-    for i in range(11, len(rets)):
-        w = rets[i - 11:i + 1]
-        mu = float(w.mean() * 12.0)
-        sigma = float(w.std() * np.sqrt(12.0))
-        rolling_ret[i] = mu
-        if sigma > 1e-12:
-            rolling_sharpe[i] = mu / sigma
-
-    rows = []
-    for i, eom in enumerate(dates):
-        rows.append({
-            'model': model_name,
-            'portfolio': portfolio,
-            'scaling': scaling,
-            'eom': pd.Timestamp(eom).strftime('%Y-%m-%d'),
-            'return': round(float(rets[i]), 6),
-            'cumulative_wealth': round(float(cw[i]), 6),
-            'drawdown': round(float(dd[i]), 6),
-            'rolling_sharpe_12m': (
-                None if np.isnan(rolling_sharpe[i])
-                else round(float(rolling_sharpe[i]), 4)
-            ),
-            'rolling_ann_ret_12m': (
-                None if np.isnan(rolling_ret[i])
-                else round(float(rolling_ret[i]) * 100, 4)
-            ),
-        })
-    return rows
-
-
-# training
-
-def train_mlp(params, x_pool, y_pool, val_dates_local, n_epochs, patience_val, dev, seed, early_stop=True):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if dev.type == 'cuda':
-        torch.cuda.manual_seed_all(seed)
-
-    model = MLP(
-        n_features=x_pool.shape[1],
-        d_model=params['d_model'],
-        dropout=params['dropout'],
-    ).to(dev)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=params['learning_rate'],
-        weight_decay=params['weight_decay'],
-    )
-    criterion = nn.MSELoss()
-
-    x_t = torch.from_numpy(x_pool).float().to(dev)
-    y_t = torch.from_numpy(y_pool).float().to(dev)
-    n_total = len(x_t)
-    batch_size = params['batch_size']
-    predictor = MLPPredictor(model, dev)
-
-    best_rc = -np.inf
-    best_state = None
-    best_epoch = 0
-    patience_ctr = 0
-    train_losses, val_rank_corrs = [], []
-
-    for epoch in range(n_epochs):
-        model.train()
-        perm = torch.randperm(n_total, device=dev)
-        epoch_loss = 0.0
-        n_batches = 0
-        for i in range(0, n_total, batch_size):
-            idx = perm[i:i + batch_size]
-            pred = model(x_t[idx])
-            loss = criterion(pred, y_t[idx])
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
-            optimizer.step()
-            epoch_loss += float(loss.item())
-            n_batches += 1
-
-        avg_loss = epoch_loss / max(n_batches, 1)
-        train_losses.append(avg_loss)
-
-        if early_stop:
-            val_rc = rank_correlation_oos(predictor.predict, val_dates_local, all_months)
-            val_rank_corrs.append(val_rc)
-            if val_rc > best_rc:
-                best_rc = val_rc
-                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                best_epoch = epoch
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-                if patience_ctr >= patience_val:
-                    break
-        else:
-            best_epoch = epoch
-
-    if early_stop and best_state is not None:
-        model.load_state_dict(best_state)
-
-    return model, {
-        'train_losses': train_losses,
-        'val_rank_corrs': val_rank_corrs,
-        'best_epoch': best_epoch,
-        'best_val_rc': float(best_rc) if early_stop else float('nan'),
-        'n_epochs_run': len(train_losses),
-    }
+	def __init__(self, model, dev):
+		self.model = model
+		self.dev = dev
+
+	def predict(self, x):
+		self.model.eval()
+		with torch.no_grad():
+			x_t = torch.from_numpy(x).float().to(self.dev)
+			return self.model(x_t).cpu().numpy()
+
+
+def train_mlp(params, x_pool, y_pool, val_dates_local, n_epochs, patience_val, dev, seed, early_stop = True):
+	torch.manual_seed(seed)
+	np.random.seed(seed)
+	if dev.type == 'cuda':
+		torch.cuda.manual_seed_all(seed)
+
+	model = MLP(n_features = x_pool.shape[1], d_model = params['d_model'], dropout = params['dropout']).to(dev)
+	optimizer = torch.optim.AdamW(model.parameters(), lr = params['learning_rate'], weight_decay = params['weight_decay'])
+	criterion = nn.MSELoss()
+
+	x_t = torch.from_numpy(x_pool).float().to(dev)
+	y_t = torch.from_numpy(y_pool).float().to(dev)
+	n_total = len(x_t)
+	batch_size = params['batch_size']
+	predictor = MLPPredictor(model, dev)
+
+	best_rc = -np.inf
+	best_state = None
+	best_epoch = 0
+	patience_ctr = 0
+	train_losses, val_rank_corrs = [], []
+
+	for epoch in range(n_epochs):
+		model.train()
+		perm = torch.randperm(n_total, device = dev)
+		epoch_loss = 0.0
+		n_batches = 0
+		for i in range(0, n_total, batch_size):
+			idx = perm[i:i + batch_size]
+			pred = model(x_t[idx])
+			loss = criterion(pred, y_t[idx])
+			optimizer.zero_grad()
+			loss.backward()
+			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = grad_clip_norm)
+			optimizer.step()
+			epoch_loss += float(loss.item())
+			n_batches += 1
+
+		train_losses.append(epoch_loss / max(n_batches, 1))
+
+		if early_stop:
+			val_rc = rank_correlation_oos(predictor.predict, val_dates_local, all_months)
+			val_rank_corrs.append(val_rc)
+			if val_rc > best_rc:
+				best_rc = val_rc
+				best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+				best_epoch = epoch
+				patience_ctr = 0
+			else:
+				patience_ctr += 1
+				if patience_ctr >= patience_val:
+					break
+		else:
+			best_epoch = epoch
+
+	if early_stop and best_state is not None:
+		model.load_state_dict(best_state)
+
+	return model, {
+		'train_losses': train_losses, 'val_rank_corrs': val_rank_corrs,
+		'best_epoch': best_epoch, 'best_val_rc': float(best_rc) if early_stop else float('nan'),
+		'n_epochs_run': len(train_losses),
+	}
 
 
 # hyperparameter search. the objective is the validation long short sharpe
 # under the mean split capped softmax construction with the volatility
-# overlay applied. this matches the construction used for all other benchmarks.
+# overlay applied, matching the construction used for the other benchmarks
 
-mlp_best_params_path = results_dir / 'mlp_best_params.json'
-mlp_study_path = results_dir / 'mlp_optuna_study.pkl'
-mlp_trials_path = results_dir / 'mlp_optuna_trials.csv'
+def mlp_objective(trial):
+	params = {
+		'd_model': trial.suggest_categorical('d_model', [64, 128, 256, 512]),
+		'dropout': trial.suggest_float('dropout', 0.0, 0.5),
+		'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log = True),
+		'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-2, log = True),
+		'batch_size': trial.suggest_categorical('batch_size', [512, 1024, 2048]),
+	}
+	model, log = train_mlp(params, x_train, y_train, val_dates, n_epochs_hpo, patience, device, torch_seed, early_stop = True)
+	predictor = MLPPredictor(model, device)
+	ls_sharpe, lo_sharpe = validation_sharpes(predictor.predict, val_dates, all_months, cfg)
 
-if mlp_best_params_path.exists():
-    with open(mlp_best_params_path) as fh:
-        cached = json.load(fh)
-    mlp_best = cached['best_params']
-    mlp_best_value = cached['best_value']
-    mlp_best_epoch = int(cached['best_epoch'])
-    mlp_hpo_time = cached['hpo_time_seconds']
-    if mlp_study_path.exists():
-        with open(mlp_study_path, 'rb') as fh:
-            mlp_study = pickle.load(fh)
-    else:
-        mlp_study = None
-    print(f'mlp best params loaded from {mlp_best_params_path.name}')
-    print(f'mlp best val ls sharpe: {mlp_best_value:.4f}, best epoch: {mlp_best_epoch}')
-else:
-    def mlp_objective(trial):
-        params = {
-            'd_model': trial.suggest_categorical('d_model', [64, 128, 256, 512]),
-            'dropout': trial.suggest_float('dropout', 0.0, 0.5),
-            'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
-            'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True),
-            'batch_size': trial.suggest_categorical('batch_size', [512, 1024, 2048]),
-        }
-        model, log = train_mlp(
-            params=params,
-            x_pool=x_train,
-            y_pool=y_train,
-            val_dates_local=val_dates,
-            n_epochs=n_epochs_hpo,
-            patience_val=patience,
-            dev=device,
-            seed=torch_seed,
-            early_stop=True,
-        )
-        predictor = MLPPredictor(model, device)
-        sim = run_mean_split_simulation(predictor, val_dates)
-        ls = sim['long_short']
-        lo = sim['long_only']
-        if len(ls['returns']) == 0:
-            return -999.0
-        ls_scaled, _, _ = apply_overlay_and_costs(
-            ls['returns'], ls['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_short)
-        lo_scaled, _, _ = apply_overlay_and_costs(
-            lo['returns'], lo['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_only)
-        ls_sharpe = portfolio_metrics(ls_scaled, periods_per_year).get('sharpe', -999.0)
-        lo_sharpe = portfolio_metrics(lo_scaled, periods_per_year).get('sharpe', -999.0)
-
-        if not np.isfinite(ls_sharpe):
-            ls_sharpe = -999.0
-        if not np.isfinite(lo_sharpe):
-            lo_sharpe = -999.0
-        trial.set_user_attr('best_epoch', int(log['best_epoch']))
-        trial.set_user_attr('n_epochs_run', int(log['n_epochs_run']))
-        trial.set_user_attr('best_val_rc', float(log['best_val_rc']))
-        trial.set_user_attr('val_sharpe_long_only', float(lo_sharpe))
-        return float(ls_sharpe)
-
-    mlp_study = optuna.create_study(
-        direction='maximize',
-        sampler=optuna.samplers.TPESampler(seed=optuna_seed),
-    )
-    t0 = time.time()
-    mlp_study.optimize(mlp_objective, n_trials=n_trials, show_progress_bar=True)
-    mlp_hpo_time = time.time() - t0
-    mlp_best = mlp_study.best_params
-    mlp_best_value = float(mlp_study.best_value)
-    mlp_best_epoch = int(mlp_study.best_trial.user_attrs.get('best_epoch', n_epochs_hpo - 1))
-
-    with open(mlp_best_params_path, 'w') as fh:
-        json.dump({
-            'construction': 'mean_split_softmax_cap_6m',
-            'best_params': mlp_best,
-            'best_value': mlp_best_value,
-            'best_epoch': mlp_best_epoch,
-            'best_trial_number': int(mlp_study.best_trial.number),
-            'best_trial_user_attrs': dict(mlp_study.best_trial.user_attrs),
-            'n_trials_completed': sum(
-                1 for t in mlp_study.trials if t.state.name == 'COMPLETE'
-            ),
-            'hpo_time_seconds': float(mlp_hpo_time),
-        }, fh, indent=2, default=float)
-
-    mlp_study.trials_dataframe().to_csv(mlp_trials_path, index=False)
-    with open(mlp_study_path, 'wb') as fh:
-        pickle.dump(mlp_study, fh)
-
-    print(f'mlp best val ls sharpe: {mlp_best_value:.4f}')
-    print(f'mlp best params: {mlp_best}')
-    print(f'mlp best epoch: {mlp_best_epoch}')
-    print(f'mlp hpo time: {mlp_hpo_time:.1f} s')
+	trial.set_user_attr('best_epoch', int(log['best_epoch']))
+	trial.set_user_attr('n_epochs_run', int(log['n_epochs_run']))
+	trial.set_user_attr('best_val_rc', float(log['best_val_rc']))
+	trial.set_user_attr('val_sharpe_long_only', float(lo_sharpe))
+	return ls_sharpe
 
 
-# final training on training data only. trains for best_epoch + 1 epochs
-# with no early stopping. the validation set was used to select best_epoch
-# during the hpo search
+mlp_cached, mlp_study = hpo_run_or_load(
+	results_dir, 'mlp', mlp_objective, n_trials, optuna_seed,
+	extra_fields = lambda study: {'best_epoch': int(study.best_trial.user_attrs.get('best_epoch', n_epochs_hpo - 1))},
+)
+mlp_best = mlp_cached['best_params']
+mlp_best_value = mlp_cached['best_value']
+mlp_best_epoch = int(mlp_cached['best_epoch'])
+mlp_hpo_time = mlp_cached['hpo_time_seconds']
+print(f'mlp best epoch: {mlp_best_epoch}')
 
+
+# final training on training data only, for best_epoch + 1 epochs with no
+# early stopping. the validation set was already used to pick best_epoch
 n_final_epochs = mlp_best_epoch + 1
 
 t0 = time.time()
-mlp_model, mlp_log = train_mlp(
-    params=mlp_best, x_pool=x_train,
-    y_pool=y_train, val_dates_local=None,
-    n_epochs=n_final_epochs, patience_val=patience,
-    dev=device, seed=torch_seed,
-    early_stop=False,
-)
+mlp_model, mlp_log = train_mlp(mlp_best, x_train, y_train, None, n_final_epochs, patience, device, torch_seed, early_stop = False)
 mlp_train_time = time.time() - t0
 mlp_predictor = MLPPredictor(mlp_model, device)
 n_params = sum(p.numel() for p in mlp_model.parameters())
@@ -796,278 +199,123 @@ print(f'parameter count: {n_params:,}')
 
 safetensors_save(mlp_model.state_dict(), str(results_dir / 'mlp_weights.safetensors'))
 
-with open(results_dir / 'mlp_train_log.json', 'w') as mlps:
-    json.dump({
-        'train_losses': mlp_log['train_losses'],
-        'best_epoch_from_hpo': mlp_best_epoch,
-        'n_final_epochs': n_final_epochs,
-        'training_time_seconds': float(mlp_train_time),
-        'parameter_count': int(n_params),
-    }, mlps, indent=2, default=float)
+with open(results_dir / 'mlp_train_log.json', 'w') as fh:
+	json.dump({
+		'train_losses': mlp_log['train_losses'],
+		'best_epoch_from_hpo': mlp_best_epoch,
+		'n_final_epochs': n_final_epochs,
+		'training_time_seconds': float(mlp_train_time),
+		'parameter_count': int(n_params),
+	}, fh, indent = 2, default = float)
 
 
 mlp_rc_val = rank_correlation_oos(mlp_predictor.predict, val_dates, all_months)
 mlp_rc_test = rank_correlation_oos(mlp_predictor.predict, test_dates, all_months)
 print(f'mlp rank corr: val = {mlp_rc_val:.4f}, test = {mlp_rc_test:.4f}')
 
-# test set evaluation. the simulation runs on all sorted_dates so the
-# volatility overlay has full warm up history before the test window begins.
-# the return series is then sliced to the test window before computing metrics
-
-def evaluate_and_save(predictor, name):
-    sim = run_mean_split_simulation(predictor, sorted_dates)
-    ls = sim['long_short']
-    lo = sim['long_only']
-
-    ls_scaled_full, ls_unscaled_full, ls_lev = apply_overlay_and_costs(
-        ls['returns'], ls['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_short)
-    lo_scaled_full, lo_unscaled_full, lo_lev = apply_overlay_and_costs(
-        lo['returns'], lo['tc'], target_vol, n_vol_periods, periods_per_year, max_leverage_long_only)
-
-    test_set = set(test_dates)
-    ls_mask = np.array([d in test_set for d in ls['dates']])
-    lo_mask = np.array([d in test_set for d in lo['dates']])
-
-    ls_unscaled_test = ls_unscaled_full[ls_mask]
-    ls_scaled_test = ls_scaled_full[ls_mask]
-    lo_unscaled_test = lo_unscaled_full[lo_mask]
-    lo_scaled_test = lo_scaled_full[lo_mask]
-
-    ls_dates_test = [d for d, m in zip(ls['dates'], ls_mask) if m]
-    lo_dates_test = [d for d, m in zip(lo['dates'], lo_mask) if m]
-
-    ls_ret_df = pd.DataFrame({
-        'eom': ls_dates_test, 'return_unscaled': ls_unscaled_test,
-        'return_scaled': ls_scaled_test, 'leverage': ls_lev[ls_mask],
-    })
-    lo_ret_df = pd.DataFrame({
-        'eom': lo_dates_test, 'return_unscaled': lo_unscaled_test,
-        'return_scaled': lo_scaled_test, 'leverage': lo_lev[lo_mask],
-    })
-
-    ls_hold_df = (ls['holdings_df'][ls['holdings_df']['eom'].isin(test_set)].copy().reset_index(drop=True))
-    lo_hold_df = (lo['holdings_df'][lo['holdings_df']['eom'].isin(test_set)].copy().reset_index(drop=True))
-    m_ls_unscaled = portfolio_metrics(ls_unscaled_test, periods_per_year, dates=ls_dates_test)
-    m_ls_scaled = portfolio_metrics(ls_scaled_test, periods_per_year, dates=ls_dates_test)
-    m_lo_unscaled = portfolio_metrics(lo_unscaled_test, periods_per_year, dates=lo_dates_test)
-    m_lo_scaled = portfolio_metrics(lo_scaled_test, periods_per_year, dates=lo_dates_test)
-
-    ls_ret_df.to_csv(results_dir / f'{name}_returns_long_short.csv', index=False)
-    lo_ret_df.to_csv(results_dir / f'{name}_returns_long_only.csv', index=False)
-    ls_hold_df.to_csv(results_dir / f'{name}_holdings_long_short.csv', index=False)
-    lo_hold_df.to_csv(results_dir / f'{name}_holdings_long_only.csv', index=False)
-
-    predict_at_dates(predictor.predict, test_dates, all_months).to_csv(
-        results_dir / f'{name}_test_predictions.csv', index=False,
-    )
-
-    return {
-        'returns_ls_unscaled': ls_unscaled_test,
-        'returns_ls_scaled': ls_scaled_test,
-        'returns_lo_unscaled': lo_unscaled_test,
-        'returns_lo_scaled': lo_scaled_test,
-        'dates_ls': ls_dates_test,
-        'dates_lo': lo_dates_test,
-        'metrics': {
-            'long_short_unscaled': m_ls_unscaled,
-            'long_short_scaled': m_ls_scaled,
-            'long_only_unscaled': m_lo_unscaled,
-            'long_only_scaled': m_lo_scaled,
-        },
-    }
-
-
-mlp_eval = evaluate_and_save(mlp_predictor, 'mlp')
+mlp_eval = evaluate_and_save(mlp_predictor.predict, 'mlp', all_months, sorted_dates, test_dates, results_dir, cfg)
 
 mls = mlp_eval['metrics']['long_short_scaled']
 mlo = mlp_eval['metrics']['long_only_scaled']
-print(f'mlp long short scaled: sharpe = {mls["sharpe"]:.4f}, '
-    f'ann_ret = {mls["ann_ret"] * 100:.2f}%, ann_vol = {mls["ann_vol"] * 100:.2f}%')
-print(f'mlp long only scaled: sharpe = {mlo["sharpe"]:.4f}, '
-    f'ann_ret = {mlo["ann_ret"] * 100:.2f}%, ann_vol = {mlo["ann_vol"] * 100:.2f}%')
-
-# summary json
-
-def _strip_per_year(m):
-    if not isinstance(m, dict):
-        return m
-    return {k: v for k, v in m.items() if k != 'per_year'}
+print(f'mlp long short scaled: sharpe = {mls["sharpe"]:.4f}, ann_ret = {mls["ann_ret"] * 100:.2f}%, ann_vol = {mls["ann_vol"] * 100:.2f}%')
+print(f'mlp long only scaled: sharpe = {mlo["sharpe"]:.4f}, ann_ret = {mlo["ann_ret"] * 100:.2f}%, ann_vol = {mlo["ann_vol"] * 100:.2f}%')
 
 
 summary = {
-    'construction': 'mean_split_softmax_cap_6m',
-    'target_column': ret_col,
-    'n_features': len(feature_cols),
-    'feature_cols': feature_cols,
-    'architecture': {
-        'name': 'three_layer_mlp',
-        'n_hidden_layers': 3,
-        'hidden_width': mlp_best['d_model'],
-        'activation': 'elu',
-        'dropout': mlp_best['dropout'],
-        'parameter_count': int(n_params),
-    },
-    'split': {
-        'train': {
-            'start': str(train_dates[0].date()), 'end': str(train_dates[-1].date()),
-            'n_months': len(train_dates), 'n_obs': int(x_train.shape[0]),
-        },
-        'val': {
-            'start': str(val_dates[0].date()), 'end': str(val_dates[-1].date()),
-            'n_months': len(val_dates),
-        },
-        'test': {
-            'start': str(test_dates[0].date()), 'end': str(test_dates[-1].date()),
-            'n_months': len(test_dates),
-        },
-    },
-    'config': {
-        'rebalance_freq': rebalance_freq,
-        'horizon_months': horizon_months,
-        'tc_bps': tc_bps,
-        'min_stocks': min_stocks,
-        'min_leg_stocks': min_leg_stocks,
-        'ret_clip': [ret_clip_low, ret_clip_high],
-        'target_vol': target_vol,
-        'vol_lookback_months': vol_lookback_months,
-        'vol_lookback_periods': vol_lookback_periods,
-        'n_vol_periods': n_vol_periods,
-        'periods_per_year': periods_per_year,
-        'max_leverage_long_only': max_leverage_long_only,
-        'max_leverage_long_short': max_leverage_long_short,
-        'max_position_weight': max_position_weight,
-        'n_epochs_hpo': n_epochs_hpo,
-        'n_final_epochs': n_final_epochs,
-        'patience': patience,
-        'grad_clip_norm': grad_clip_norm,
-        'optuna_seed': optuna_seed,
-        'torch_seed': torch_seed,
-        'n_trials': n_trials,
-    },
-    'mlp': {
-        'best_params': mlp_best,
-        'best_val_long_short_sharpe': float(mlp_best_value),
-        'best_trial_number': (
-            int(mlp_study.best_trial.number) if mlp_study is not None else None
-        ),
-        'n_trials_completed': (
-            sum(1 for t in mlp_study.trials if t.state.name == 'COMPLETE')
-            if mlp_study is not None else None
-        ),
-        'hpo_time_seconds': float(mlp_hpo_time),
-        'final_training_time_seconds': float(mlp_train_time),
-        'best_epoch_from_hpo': mlp_best_epoch,
-        'n_final_epochs': n_final_epochs,
-        'rc_val': float(mlp_rc_val),
-        'rc_test': float(mlp_rc_test),
-        'portfolio_metrics': {k: _strip_per_year(v) for k, v in mlp_eval['metrics'].items()},
-    },
+	'construction': 'mean_split_softmax_cap_6m',
+	'target_column': ret_col,
+	'n_features': len(feature_cols),
+	'feature_cols': feature_cols,
+	'architecture': {
+		'name': 'three_layer_mlp', 'n_hidden_layers': 3, 'hidden_width': mlp_best['d_model'],
+		'activation': 'elu', 'dropout': mlp_best['dropout'], 'parameter_count': int(n_params),
+	},
+	'split': {
+		'train': {'start': str(train_dates[0].date()), 'end': str(train_dates[-1].date()), 'n_months': len(train_dates), 'n_obs': int(x_train.shape[0])},
+		'val': {'start': str(val_dates[0].date()), 'end': str(val_dates[-1].date()), 'n_months': len(val_dates)},
+		'test': {'start': str(test_dates[0].date()), 'end': str(test_dates[-1].date()), 'n_months': len(test_dates)},
+	},
+	'config': {
+		'rebalance_freq': cfg.rebalance_freq, 'horizon_months': cfg.horizon_months,
+		'tc_bps': cfg.tc_bps, 'min_stocks': cfg.min_stocks, 'min_leg_stocks': cfg.min_leg_stocks,
+		'ret_clip': [cfg.ret_clip_low, cfg.ret_clip_high], 'target_vol': cfg.target_vol,
+		'vol_lookback_months': cfg.vol_lookback_months, 'vol_lookback_periods': cfg.vol_lookback_periods,
+		'n_vol_periods': cfg.n_vol_periods, 'periods_per_year': cfg.periods_per_year,
+		'max_leverage_long_only': cfg.max_leverage_long_only, 'max_leverage_long_short': cfg.max_leverage_long_short,
+		'max_position_weight': cfg.max_position_weight, 'n_epochs_hpo': n_epochs_hpo,
+		'n_final_epochs': n_final_epochs, 'patience': patience, 'grad_clip_norm': grad_clip_norm,
+		'optuna_seed': optuna_seed, 'torch_seed': torch_seed, 'n_trials': n_trials,
+	},
+	'mlp': {
+		'best_params': mlp_best, 'best_val_long_short_sharpe': mlp_best_value,
+		'best_trial_number': mlp_study.best_trial.number if mlp_study is not None else None,
+		'n_trials_completed': sum(1 for t in mlp_study.trials if t.state.name == 'COMPLETE') if mlp_study is not None else None,
+		'hpo_time_seconds': float(mlp_hpo_time), 'final_training_time_seconds': float(mlp_train_time),
+		'best_epoch_from_hpo': mlp_best_epoch, 'n_final_epochs': n_final_epochs,
+		'rc_val': float(mlp_rc_val), 'rc_test': float(mlp_rc_test),
+		'portfolio_metrics': {k: strip_per_year(v) for k, v in mlp_eval['metrics'].items()},
+	},
 }
 
 with open(results_dir / 'mlp_summary.json', 'w') as fh:
-    json.dump(summary, fh, indent=2, default=float)
+	json.dump(summary, fh, indent = 2, default = float)
 print('summary json saved')
-
-
-# headline summary csv
-
-def _round_or_none(x, ndigits):
-    if x is None:
-        return None
-    if isinstance(x, float) and np.isnan(x):
-        return None
-    return round(float(x), ndigits)
 
 
 rows = []
 for portfolio, scaling, key in [
-    ('long_short', 'unscaled', 'long_short_unscaled'),
-    ('long_short', 'scaled', 'long_short_scaled'),
-    ('long_only', 'unscaled', 'long_only_unscaled'),
-    ('long_only', 'scaled', 'long_only_scaled'),
+	('long_short', 'unscaled', 'long_short_unscaled'), ('long_short', 'scaled', 'long_short_scaled'),
+	('long_only', 'unscaled', 'long_only_unscaled'), ('long_only', 'scaled', 'long_only_scaled'),
 ]:
-    m = mlp_eval['metrics'][key]
-    rows.append({
-        'model': 'mlp',
-        'portfolio': portfolio,
-        'scaling': scaling,
-        'rc_test': round(mlp_rc_test, 4),
-        'sharpe': _round_or_none(m['sharpe'], 4),
-        'se': _round_or_none(m['se_sharpe'], 4),
-        'ann_ret': _round_or_none(m['ann_ret'] * 100, 2),
-        'ann_vol': _round_or_none(m['ann_vol'] * 100, 2),
-        'cagr': _round_or_none(m['cagr'] * 100, 2),
-        'cum_return': _round_or_none(m['cum_return'] * 100, 2),
-        'max_dd': _round_or_none(m['max_dd'] * 100, 2),
-        'n_obs': m['n_obs'],
-    })
+	m = mlp_eval['metrics'][key]
+	rows.append({
+		'model': 'mlp', 'portfolio': portfolio, 'scaling': scaling, 'rc_test': round(mlp_rc_test, 4),
+		'sharpe': round_or_none(m['sharpe'], 4), 'se': round_or_none(m['se_sharpe'], 4),
+		'ann_ret': round_or_none(m['ann_ret'] * 100, 2), 'ann_vol': round_or_none(m['ann_vol'] * 100, 2),
+		'cagr': round_or_none(m['cagr'] * 100, 2), 'cum_return': round_or_none(m['cum_return'] * 100, 2),
+		'max_dd': round_or_none(m['max_dd'] * 100, 2), 'n_obs': m['n_obs'],
+	})
 
 summary_table = pd.DataFrame(rows)
 print('MLP Benchmark, EM Universe, mean split capped softmax, 6m rebalance')
-print(summary_table.to_string(index=False))
-summary_table.to_csv(results_dir / 'mlp_summary.csv', index=False)
+print(summary_table.to_string(index = False))
+summary_table.to_csv(results_dir / 'mlp_summary.csv', index = False)
 print('summary csv saved')
 
-# per year breakdown csv
+
 per_year_rows = []
-
-def _flush_per_year(model_name, portfolio, scaling, metrics):
-    py = metrics.get('per_year', {}) if isinstance(metrics, dict) else {}
-    for year in sorted(py.keys()):
-        ym = py[year]
-        per_year_rows.append({
-            'model': model_name,
-            'portfolio': portfolio,
-            'scaling': scaling,
-            'year': int(year),
-            'ann_ret': round(float(ym['ann_ret']) * 100, 4),
-            'ann_vol': round(float(ym['ann_vol']) * 100, 4),
-            'sharpe': (
-                round(float(ym['sharpe']), 4)
-                if not (isinstance(ym['sharpe'], float) and np.isnan(ym['sharpe']))
-                else None
-            ),
-            'max_dd': round(float(ym['max_dd']) * 100, 4),
-            'cum_return': round(float(ym['cum_return']) * 100, 4),
-            'n_obs': int(ym['n_obs']),
-        })
-
-
-_flush_per_year('mlp', 'long_short', 'unscaled', mlp_eval['metrics']['long_short_unscaled'])
-_flush_per_year('mlp', 'long_short', 'scaled', mlp_eval['metrics']['long_short_scaled'])
-_flush_per_year('mlp', 'long_only', 'unscaled', mlp_eval['metrics']['long_only_unscaled'])
-_flush_per_year('mlp', 'long_only', 'scaled', mlp_eval['metrics']['long_only_scaled'])
+flush_per_year_rows(per_year_rows, 'mlp', 'long_short', 'unscaled', mlp_eval['metrics']['long_short_unscaled'])
+flush_per_year_rows(per_year_rows, 'mlp', 'long_short', 'scaled', mlp_eval['metrics']['long_short_scaled'])
+flush_per_year_rows(per_year_rows, 'mlp', 'long_only', 'unscaled', mlp_eval['metrics']['long_only_unscaled'])
+flush_per_year_rows(per_year_rows, 'mlp', 'long_only', 'scaled', mlp_eval['metrics']['long_only_scaled'])
 
 per_year_df = pd.DataFrame(per_year_rows)
-per_year_df.to_csv(results_dir / 'mlp_per_year_metrics.csv', index=False)
+per_year_df.to_csv(results_dir / 'mlp_per_year_metrics.csv', index = False)
 print(f'per year metrics saved, {len(per_year_df)} rows')
 
 
-# per period metrics csv
-
 period_rows = []
 for portfolio, scaling, rets, dates in [
-    ('long_short', 'unscaled', mlp_eval['returns_ls_unscaled'], mlp_eval['dates_ls']),
-    ('long_short', 'scaled', mlp_eval['returns_ls_scaled'], mlp_eval['dates_ls']),
-    ('long_only', 'unscaled', mlp_eval['returns_lo_unscaled'], mlp_eval['dates_lo']),
-    ('long_only', 'scaled', mlp_eval['returns_lo_scaled'], mlp_eval['dates_lo']),
+	('long_short', 'unscaled', mlp_eval['returns_ls_unscaled'], mlp_eval['dates_ls']),
+	('long_short', 'scaled', mlp_eval['returns_ls_scaled'], mlp_eval['dates_ls']),
+	('long_only', 'unscaled', mlp_eval['returns_lo_unscaled'], mlp_eval['dates_lo']),
+	('long_only', 'scaled', mlp_eval['returns_lo_scaled'], mlp_eval['dates_lo']),
 ]:
-    period_rows.extend(_build_period_rows('mlp', portfolio, scaling, rets, dates))
+	period_rows.extend(build_diagnostic_rows('mlp', portfolio, scaling, rets, dates, cfg.periods_per_year, 4, '4p'))
 
 per_period_df = pd.DataFrame(period_rows)
-per_period_df.to_csv(results_dir / 'mlp_per_period_metrics.csv', index=False)
+per_period_df.to_csv(results_dir / 'mlp_per_period_metrics.csv', index = False)
 print(f'per period metrics saved, {len(per_period_df)} rows')
 
 
-# monthly simulation. the monthly variant runs on sorted_dates so the
-# vol overlay has full warm up before the test window. the return series
-# is then sliced to the test window for metrics and csv output.
-mo_sim = run_mean_split_simulation_monthly(mlp_predictor, sorted_dates)
+# monthly diagnostic simulation, run over sorted_dates so the vol overlay
+# has full warm up before the test window, then sliced to the test window
+mo_sim = run_mean_split_simulation_monthly(mlp_predictor.predict, sorted_dates, all_months, cfg)
 mo_ls = mo_sim['long_short']
 mo_lo = mo_sim['long_only']
 
-mo_ls_lev = apply_vol_target_monthly(mo_ls['returns'] - mo_ls['tc'], mo_ls['rb_indices'], target_vol, vol_lookback_months, max_leverage_long_short)
-mo_lo_lev = apply_vol_target_monthly(mo_lo['returns'] - mo_lo['tc'], mo_lo['rb_indices'], target_vol, vol_lookback_months, max_leverage_long_only)
+mo_ls_lev = apply_vol_target_monthly(mo_ls['returns'] - mo_ls['tc'], mo_ls['rb_indices'], cfg.target_vol, cfg.vol_lookback_months, cfg.max_leverage_long_short)
+mo_lo_lev = apply_vol_target_monthly(mo_lo['returns'] - mo_lo['tc'], mo_lo['rb_indices'], cfg.target_vol, cfg.vol_lookback_months, cfg.max_leverage_long_only)
 
 mo_ls_unscaled_full = mo_ls['returns'] - mo_ls['tc']
 mo_ls_scaled_full = mo_ls_lev * mo_ls['returns'] - mo_ls_lev * mo_ls['tc']
@@ -1082,31 +330,24 @@ mo_ls_unscaled_test = mo_ls_unscaled_full[mo_ls_mask]
 mo_ls_scaled_test = mo_ls_scaled_full[mo_ls_mask]
 mo_lo_unscaled_test = mo_lo_unscaled_full[mo_lo_mask]
 mo_lo_scaled_test = mo_lo_scaled_full[mo_lo_mask]
-mo_ls_dates_test = [d for d, m in zip(mo_ls['dates'], mo_ls_mask) if m]
-mo_lo_dates_test = [d for d, m in zip(mo_lo['dates'], mo_lo_mask) if m]
+mo_ls_dates_test = [d for d, keep in zip(mo_ls['dates'], mo_ls_mask) if keep]
+mo_lo_dates_test = [d for d, keep in zip(mo_lo['dates'], mo_lo_mask) if keep]
 
-mo_ls_unscaled_m = portfolio_metrics(mo_ls_unscaled_test, 12.0, dates=mo_ls_dates_test)
-mo_ls_scaled_m = portfolio_metrics(mo_ls_scaled_test, 12.0, dates=mo_ls_dates_test)
-mo_lo_unscaled_m = portfolio_metrics(mo_lo_unscaled_test, 12.0, dates=mo_lo_dates_test)
-mo_lo_scaled_m = portfolio_metrics(mo_lo_scaled_test, 12.0, dates=mo_lo_dates_test)
+mo_ls_scaled_m = portfolio_metrics(mo_ls_scaled_test, 12.0, dates = mo_ls_dates_test)
+mo_lo_scaled_m = portfolio_metrics(mo_lo_scaled_test, 12.0, dates = mo_lo_dates_test)
 
-print(f'mlp monthly long short scaled: sharpe = {mo_ls_scaled_m["sharpe"]:.4f},'
-    f'ann_ret = {mo_ls_scaled_m["ann_ret"] * 100:.2f}%, ann_vol = {mo_ls_scaled_m["ann_vol"] * 100:.2f}%'
-)
-print(
-    f'mlp monthly long only scaled: sharpe = {mo_lo_scaled_m["sharpe"]:.4f},'
-    f'ann_ret = {mo_lo_scaled_m["ann_ret"] * 100:.2f}%, ann_vol = {mo_lo_scaled_m["ann_vol"] * 100:.2f}%'
-)
+print(f'mlp monthly long short scaled: sharpe = {mo_ls_scaled_m["sharpe"]:.4f}, ann_ret = {mo_ls_scaled_m["ann_ret"] * 100:.2f}%, ann_vol = {mo_ls_scaled_m["ann_vol"] * 100:.2f}%')
+print(f'mlp monthly long only scaled: sharpe = {mo_lo_scaled_m["sharpe"]:.4f}, ann_ret = {mo_lo_scaled_m["ann_ret"] * 100:.2f}%, ann_vol = {mo_lo_scaled_m["ann_vol"] * 100:.2f}%')
 
 monthly_rows = []
 for portfolio, scaling, rets, dates in [
-    ('long_short', 'unscaled', mo_ls_unscaled_test, mo_ls_dates_test),
-    ('long_short', 'scaled', mo_ls_scaled_test, mo_ls_dates_test),
-    ('long_only', 'unscaled', mo_lo_unscaled_test, mo_lo_dates_test),
-    ('long_only', 'scaled', mo_lo_scaled_test, mo_lo_dates_test),
+	('long_short', 'unscaled', mo_ls_unscaled_test, mo_ls_dates_test),
+	('long_short', 'scaled', mo_ls_scaled_test, mo_ls_dates_test),
+	('long_only', 'unscaled', mo_lo_unscaled_test, mo_lo_dates_test),
+	('long_only', 'scaled', mo_lo_scaled_test, mo_lo_dates_test),
 ]:
-    monthly_rows.extend(_build_monthly_rows('mlp', portfolio, scaling, rets, dates))
+	monthly_rows.extend(build_diagnostic_rows('mlp', portfolio, scaling, rets, dates, 12.0, 12, '12m'))
 
 per_month_df = pd.DataFrame(monthly_rows)
-per_month_df.to_csv(results_dir / 'mlp_per_month_metrics.csv', index=False)
+per_month_df.to_csv(results_dir / 'mlp_per_month_metrics.csv', index = False)
 print(f'per month metrics saved, {len(per_month_df)} rows')

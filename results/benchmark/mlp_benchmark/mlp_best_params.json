@@ -8,7 +8,6 @@
     "batch_size": 2048
   },
   "best_value": 2.246667978982398,
-  "best_epoch": 2,
   "best_trial_number": 29,
   "best_trial_user_attrs": {
     "best_epoch": 2,
@@ -17,5 +16,6 @@
     "val_sharpe_long_only": 0.6184888646244925
   },
   "n_trials_completed": 30,
-  "hpo_time_seconds": 2254.8275656700134
+  "hpo_time_seconds": 2441.5800580978394,
+  "best_epoch": 2
 }
