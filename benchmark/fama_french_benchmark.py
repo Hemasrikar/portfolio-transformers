@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import matplotlib
 import matplotlib.pyplot as plt
 from scipy import stats
 from scipy.stats import spearmanr
@@ -21,846 +20,472 @@ data_path = Path('data/Global Factor_EM.parquet')
 results_dir = Path('results/benchmark/ff_benchmark')
 results_dir.mkdir(parents = True, exist_ok = True)
 
-# jkp column names for the five fama-french factor proxies
-char_map = {
-    'value': 'be_me',
-    'profitability': 'ope_be',
-    'investment': 'at_gr1',
-    'momentum': 'ret_12_1',
-    'size': 'me',
+# factor name, jkp column, sort direction, tail fraction
+factor_defs = {
+	'value': ('be_me', False, 0.30),
+	'momentum': ('ret_12_1', False, 0.30),
+	'profitability': ('ope_be', False, 0.30),
+	'investment': ('at_gr1', True, 0.30),
+	'size': ('me', True, 0.50),
 }
-fm_chars = list(char_map.values())
+char_map = {name: col for name, (col, _, _) in factor_defs.items()}
 
 ret_col = 'ret_exc_lead1m'
 rebalance_freq = 3
 tc_bps = 25
 min_stocks = 30
-ret_clip_low = -1.0
-ret_clip_high = 1.0
+ret_clip = 1.0
 
 target_vol = 0.10
 vol_lookback_months = 12
 max_leverage_ls = 3.0
 max_leverage_lo = 3.0
 
+min_history = 60
+test_start = pd.Timestamp('2021-01-01')
 id_cols = ['id', 'eom', 'excntry', ret_col, 'me']
 
-test_start = pd.Timestamp('2021-01-01')
 
-
-schema = pq.read_schema(data_path)
-all_col_names = schema.names
-
-factor_cols = list(char_map.values())
-fm_available = [c for c in fm_chars if c in all_col_names]
-all_chars = list(dict.fromkeys(factor_cols + fm_available))
-needed = list(dict.fromkeys([c for c in id_cols + all_chars if c in all_col_names]))
+available = set(pq.read_schema(data_path).names)
+fm_available = [c for c in char_map.values() if c in available]
+needed = list(dict.fromkeys([c for c in id_cols + fm_available if c in available]))
 
 df = pd.read_parquet(data_path, columns = needed)
 df['eom'] = pd.to_datetime(df['eom'])
+for col in fm_available:
+	if df[col].dtype == np.float64:
+		df[col] = df[col].astype(np.float32)
+df[ret_col] = df[ret_col].clip(lower = -ret_clip, upper = ret_clip)
 
 print(f'rows loaded, {df.shape[0]:,}')
 print(f'columns loaded, {df.shape[1]}')
 print(f'date range, {df["eom"].min().date()} to {df["eom"].max().date()}')
 
-for col in all_chars:
-    if col in df.columns and df[col].dtype == np.float64:
-        df[col] = df[col].astype(np.float32)
-if 'me' in df.columns and df['me'].dtype == np.float64:
-    df['me'] = df['me'].astype(np.float32)
-
-df[ret_col] = df[ret_col].clip(lower = ret_clip_low, upper = ret_clip_high)
-
 
 ## Build monthly cross-sections
 
-sorted_eoms = sorted(df['eom'].unique())
+def rank_centred(vals):
+	# percentile rank in [-0.5, 0.5], zero where the characteristic is missing
+	out = np.zeros(len(vals))
+	valid = np.isfinite(vals)
+	if valid.sum() > 5:
+		out[valid] = pd.Series(vals[valid]).rank(pct = True).to_numpy() - 0.5
+	return out, valid
+
 all_months = {}
+for eom in sorted(df['eom'].unique()):
+	month = df[df['eom'] == eom]
+	if len(month) < min_stocks:
+		continue
 
-for eom in sorted_eoms:
-    month = df[df['eom'] == eom].copy()
-    if len(month) < min_stocks:
-        continue
+	entry = {
+		'ids': month['id'].values,
+		'r': month[ret_col].values.astype(np.float64),
+		'me': month['me'].values.astype(np.float64),
+	}
+	for name, col in char_map.items():
+		entry[name] = (month[col].values.astype(np.float64)
+			if col in month.columns else np.full(len(month), np.nan))
 
-    entry = {
-        'ids': month['id'].values,
-        'r': month[ret_col].values.astype(np.float64),
-        'me': (month['me'].values.astype(np.float64)
-                if 'me' in month.columns else np.ones(len(month))),
-    }
-
-    for fname, cname in char_map.items():
-        entry[fname] = (month[cname].values.astype(np.float64)
-                        if cname in month.columns else np.full(len(month), np.nan))
-
-    fm_vals = {}
-    fm_valid = {}
-    for cname in fm_available:
-        vals = (month[cname].values.astype(np.float64)
-                if cname in month.columns else np.full(len(month), np.nan))
-        valid = np.isfinite(vals)
-        ranked = np.zeros(len(month))
-        if valid.sum() > 5:
-            ranked[valid] = pd.Series(vals[valid]).rank(pct = True).to_numpy() - 0.5 
-        fm_vals[cname] = ranked
-        fm_valid[cname] = valid
-
-    if fm_available:
-        entry['fm_x'] = np.column_stack([fm_vals[c] for c in fm_available])
-        entry['fm_x_valid'] = np.column_stack([fm_valid[c] for c in fm_available])
-    else:
-        entry['fm_x'] = np.empty((len(month), 0), dtype = np.float64)
-        entry['fm_x_valid'] = np.ones((len(month), 0), dtype = bool)
-    all_months[eom] = entry
+	ranked = [rank_centred(month[col].values.astype(np.float64)) for col in fm_available]
+	entry['fm_x'] = (np.column_stack([r for r, _ in ranked]) if ranked
+		else np.empty((len(month), 0)))
+	entry['fm_x_valid'] = (np.column_stack([v for _, v in ranked]) if ranked
+		else np.ones((len(month), 0), dtype = bool))
+	all_months[eom] = entry
 
 sorted_dates = sorted(all_months.keys())
 print(f'processed months, {len(sorted_dates)}')
 
-def portfolio_metrics(rets, dates = None):
-    rets = np.array(rets, dtype = np.float64)
-    if len(rets) == 0:
-        out = {
-            'ann_ret': np.nan, 'ann_vol': np.nan, 'sharpe': np.nan,
-            'se_sharpe': np.nan, 'max_dd': np.nan, 'cum_return': np.nan,
-            'n_obs': 0,
-        }
-        if dates is not None:
-            out['per_year'] = {}
-        return out
-    n = len(rets)
-    ann_ret = float(rets.mean() * 12.0)
-    ann_vol = float(rets.std() * np.sqrt(12.0))
-    sharpe = ann_ret / max(ann_vol, 1e-8)
-    se = float(np.sqrt((1.0 + 0.5 * sharpe ** 2) / n))
-    cw = np.cumprod(1.0 + rets)
-    pk = np.maximum.accumulate(cw)
-    max_dd = float(((pk - cw) / pk).max())
-    cum_return = float(cw[-1] - 1.0)
 
-    out = {
-        'ann_ret': ann_ret, 'ann_vol': ann_vol, 'sharpe': sharpe,
-        'se_sharpe': se, 'max_dd': max_dd, 'cum_return': cum_return,
-        'n_obs': n,
-    }
+## Metrics and portfolio construction helpers
 
-    if dates is not None:
-        years = pd.DatetimeIndex(dates).year.to_numpy()
-        per_year = {}
-        for y in sorted(set(years.tolist())):
-            mask = years == y
-            sub = rets[mask]
-            if len(sub) < 2:
-                continue
-            y_ret = float(sub.mean() * 12.0)
-            y_vol = float(sub.std() * np.sqrt(12.0))
-            y_sharpe = y_ret / max(y_vol, 1e-8)
-            ycw = np.cumprod(1.0 + sub)
-            ypk = np.maximum.accumulate(ycw)
-            y_dd = float(((ypk - ycw) / ypk).max())
-            per_year[int(y)] = {
-                'ann_ret': y_ret, 'ann_vol': y_vol, 'sharpe': y_sharpe,
-                'max_dd': y_dd, 'cum_return': float(ycw[-1] - 1.0),
-                'n_obs': int(len(sub)),
-            }
-        out['per_year'] = per_year
+def return_stats(rets):
+	n = len(rets)
+	ann_ret = float(rets.mean() * 12.0)
+	ann_vol = float(rets.std() * np.sqrt(12.0))
+	sharpe = ann_ret / max(ann_vol, 1e-8)
+	wealth = np.cumprod(1.0 + rets)
+	peak = np.maximum.accumulate(wealth)
+	return {
+		'ann_ret': ann_ret,
+		'ann_vol': ann_vol,
+		'sharpe': sharpe,
+		'se_sharpe': float(np.sqrt((1.0 + 0.5 * sharpe ** 2) / n)),
+		'max_dd': float(((peak - wealth) / peak).max()),
+		'cum_return': float(wealth[-1] - 1.0),
+		'n_obs': n,
+	}
 
-    return out
+def portfolio_metrics(rets, dates):
+	rets = np.asarray(rets, dtype = np.float64)
+	if len(rets) == 0:
+		empty = dict.fromkeys(
+			['ann_ret', 'ann_vol', 'sharpe', 'se_sharpe', 'max_dd', 'cum_return'], np.nan)
+		return {**empty, 'n_obs': 0, 'per_year': {}}
 
-def apply_vol_target(monthly_rets, rebalance_indices, target_vol, lookback_months, max_leverage):
-    scaled = np.array(monthly_rets, dtype = np.float64)
-    n = len(monthly_rets)
-    n_rb = len(rebalance_indices)
-    for i in range(n_rb):
-        rb_idx = rebalance_indices[i]
-        start_month = max(0, rb_idx - lookback_months)
-        trailing = np.array(monthly_rets[start_month:rb_idx], dtype = np.float64)
-        if len(trailing) < lookback_months:
-            continue
-        sigma_ann = float(trailing.std() * np.sqrt(12.0))
-        lev = float(np.clip(target_vol / max(sigma_ann, 1e-8), 1.0 / max_leverage, max_leverage))
-        next_rb = rebalance_indices[i + 1] if i + 1 < n_rb else n
-        scaled[rebalance_indices[i]:next_rb] = (
-            np.array(monthly_rets[rebalance_indices[i]:next_rb]) * lev
-        )
-    return scaled
+	years = pd.DatetimeIndex(dates).year.to_numpy()
+	per_year = {
+		int(y): return_stats(rets[years == y])
+		for y in sorted(set(years.tolist())) if (years == y).sum() >= 2
+	}
+	return {**return_stats(rets), 'per_year': per_year}
 
-def filter_to_test_window(rets, dates, start_date):
-    rets_arr = np.array(rets, dtype = np.float64)
-    dates_arr = pd.DatetimeIndex(dates)
-    mask = dates_arr >= start_date
-    return rets_arr[mask], list(dates_arr[mask])
+def apply_vol_target(rets, rb_indices, max_leverage):
+	rets = np.asarray(rets, dtype = np.float64)
+	scaled = rets.copy()
+	for i, rb in enumerate(rb_indices):
+		trailing = rets[max(0, rb - vol_lookback_months):rb]
+		if len(trailing) < vol_lookback_months:
+			continue
+		sigma = float(trailing.std() * np.sqrt(12.0))
+		lev = float(np.clip(target_vol / max(sigma, 1e-8), 1.0 / max_leverage, max_leverage))
+		end = rb_indices[i + 1] if i + 1 < len(rb_indices) else len(rets)
+		scaled[rb:end] = rets[rb:end] * lev
+	return scaled
 
-def selected_weight_map(ids, selected_ids, weight_vals = None, gross = 1.0):
-    selected_ids = set(selected_ids)
-    if not selected_ids:
-        return {}
+def filter_to_test_window(rets, dates):
+	dates = pd.DatetimeIndex(dates)
+	mask = dates >= test_start
+	return np.asarray(rets, dtype = np.float64)[mask], list(dates[mask])
 
-    id_arr = np.asarray(ids)
-    selected = np.array([sid in selected_ids for sid in id_arr.tolist()])
-    weights = np.ones(len(id_arr), dtype = np.float64)
-    if weight_vals is not None:
-        weights = np.asarray(weight_vals, dtype = np.float64)
-        weights = np.where(np.isfinite(weights) & (weights > 0), weights, 0.0)
+def clean_weights(weight_vals, mask):
+	w = np.asarray(weight_vals, dtype = np.float64)[mask]
+	return np.where(np.isfinite(w) & (w > 0), w, 0.0)
 
-    selected_weights = weights[selected]
-    selected_ids_arr = id_arr[selected]
-    weight_sum = selected_weights.sum()
-    if weight_sum <= 0:
-        selected_weights = np.ones(len(selected_ids_arr), dtype = np.float64)
-        weight_sum = selected_weights.sum()
+def weight_map(ids, selected_ids, weight_vals, gross = 1.0):
+	if not selected_ids:
+		return {}
+	ids = np.asarray(ids)
+	mask = np.array([sid in selected_ids for sid in ids.tolist()])
+	w = clean_weights(weight_vals, mask)
+	if w.sum() <= 0:
+		w = np.ones(mask.sum())
+	return {sid: float(gross * wi / w.sum()) for sid, wi in zip(ids[mask].tolist(), w)}
 
-    return {
-        sid: float(gross * w / weight_sum)
-        for sid, w in zip(selected_ids_arr.tolist(), selected_weights)
-    }
+def turnover(new_weights, old_weights):
+	ids = set(new_weights) | set(old_weights)
+	return float(sum(abs(new_weights.get(i, 0.0) - old_weights.get(i, 0.0)) for i in ids))
 
-def portfolio_turnover(new_weights, old_weights):
-    ids = set(new_weights) | set(old_weights)
-    return float(sum(abs(new_weights.get(sid, 0.0) - old_weights.get(sid, 0.0)) for sid in ids))
+def portfolio_return(ids, rets, selected_ids, weight_vals):
+	if not selected_ids:
+		return 0.0
+	ids = np.asarray(ids)
+	mask = np.array([sid in selected_ids for sid in ids.tolist()]) & np.isfinite(rets)
+	if mask.sum() == 0:
+		return 0.0
+	w = clean_weights(weight_vals, mask)
+	if w.sum() <= 0:
+		return float(rets[mask].mean())
+	return float((w / w.sum() * rets[mask]).sum())
+
+def rebalance_set(dates):
+	if not dates:
+		return set()
+	start = pd.Timestamp(dates[0])
+	months = lambda d: (pd.Timestamp(d).year - start.year) * 12 + pd.Timestamp(d).month - start.month
+	return {d for d in dates if months(d) % rebalance_freq == 0}
 
 
-def selected_portfolio_return(ids, rets, selected_ids, weight_vals = None):
-    selected_ids = set(selected_ids)
-    if not selected_ids:
-        return 0.0
+## Backtest engine, shared by the sorted factor and Fama-MacBeth portfolios
 
-    id_arr = np.asarray(ids)
-    selected = np.array([sid in selected_ids for sid in id_arr.tolist()])
-    finite_rets = np.isfinite(rets)
-    selected = selected & finite_rets
-    selected_rets = rets[selected]
-    selected_rets = selected_rets[np.isfinite(selected_rets)]
-    if len(selected_rets) == 0:
-        return 0.0
+def run_backtest(dates, month_fn, tail_frac = 0.30, reverse = False):
+	rset = rebalance_set(dates)
+	ls_rets, lo_rets, out_dates, rb_indices = [], [], [], []
+	long_ids, short_ids = set(), set()
+	prev_ls, prev_lo = {}, {}
 
-    if weight_vals is None:
-        return float(selected_rets.mean())
+	for eom in dates:
+		ids, r, me, signal = month_fn(eom)
+		if signal is None:
+			continue
+		ls_cost = lo_cost = 0.0
 
-    selected_weights = np.asarray(weight_vals, dtype = np.float64)[selected]
-    selected_weights = np.where(np.isfinite(selected_weights) & (selected_weights > 0), selected_weights, 0.0)
-    weight_sum = selected_weights.sum()
-    if weight_sum <= 0:
-        return float(selected_rets.mean())
-    return float((selected_weights / weight_sum * selected_rets).sum())
+		if eom in rset:
+			rb_indices.append(len(out_dates))
+			valid = np.isfinite(signal)
+			if valid.sum() < 10:
+				# too few names to sort, exit the book and pay the exit cost
+				ls_rets.append(-turnover({}, prev_ls) * tc_bps / 10000.0)
+				lo_rets.append(-turnover({}, prev_lo) * tc_bps / 10000.0)
+				out_dates.append(eom)
+				prev_ls, prev_lo = {}, {}
+				long_ids, short_ids = set(), set()
+				continue
+
+			vi, vc = ids[valid], signal[valid]
+			nq = max(1, int(len(vi) * tail_frac))
+			order = np.argsort(vc)
+			top = set(vi[order[::-1][:nq]].tolist())
+			bottom = set(vi[order[:nq]].tolist())
+			long_ids, short_ids = (bottom, top) if reverse else (top, bottom)
+
+			long_w = weight_map(ids, long_ids, me, gross = 1.0)
+			ls_w = {**long_w, **weight_map(ids, short_ids, me, gross = -1.0)}
+			ls_cost = turnover(ls_w, prev_ls) * tc_bps / 10000.0
+			lo_cost = turnover(long_w, prev_lo) * tc_bps / 10000.0
+			prev_ls, prev_lo = ls_w, long_w
+
+		if not long_ids:
+			continue
+		long_ret = portfolio_return(ids, r, long_ids, me)
+		short_ret = portfolio_return(ids, r, short_ids, me)
+		ls_rets.append(long_ret - short_ret - ls_cost)
+		lo_rets.append(long_ret - lo_cost)
+		out_dates.append(eom)
+
+	return {
+		'long_short': np.array(ls_rets),
+		'long_only': np.array(lo_rets),
+		'dates': out_dates,
+		'rb_indices': rb_indices,
+	}
 
 
-## Market portfolio (value-weighted, long-only by construction)
-market_rets = []
-market_dates = []
+## Result registry, every series is stored once and reused for all outputs
+
+series = []
+
+def register(strategy, portfolio, rets, dates, rb_indices, max_leverage):
+	scaled = apply_vol_target(rets, rb_indices, max_leverage)
+	unscaled_test, dates_test = filter_to_test_window(rets, dates)
+	scaled_test, _ = filter_to_test_window(scaled, dates)
+	for scaling, r in [('unscaled', unscaled_test), ('scaled', scaled_test)]:
+		series.append({
+			'strategy': strategy,
+			'portfolio': portfolio,
+			'scaling': scaling,
+			'returns': r,
+			'dates': dates_test,
+			'metrics': portfolio_metrics(r, dates_test),
+		})
+
+
+## Market portfolio, value weighted and long only by construction
+
+market_rets, market_dates = [], []
 for eom in sorted_dates:
-    m = all_months[eom]
-    valid_me = np.isfinite(m['me']) & (m['me'] > 0)
-    valid_ret = valid_me & np.isfinite(m['r'])
-    if valid_me.sum() < 5 or valid_ret.sum() < 5:
-        continue
-    market_rets.append(selected_portfolio_return(
-        m['ids'], m['r'], set(m['ids'][valid_me].tolist()), weight_vals = m['me'],
-    ))
-    market_dates.append(eom)
+	m = all_months[eom]
+	valid_me = np.isfinite(m['me']) & (m['me'] > 0)
+	if valid_me.sum() < 5 or (valid_me & np.isfinite(m['r'])).sum() < 5:
+		continue
+	market_rets.append(portfolio_return(m['ids'], m['r'], set(m['ids'][valid_me].tolist()), m['me']))
+	market_dates.append(eom)
 
-market_rets_full = np.array(market_rets)
-
-# the market portfolio rebalances every month (it is reweighted by market
-# cap each month). the vol overlay uses the same trailing window length as
-# the factor portfolios so the scaled column is comparable across rows.
-market_rb_indices = list(range(len(market_rets_full)))
-market_scaled_full = apply_vol_target(
-    market_rets_full, market_rb_indices, target_vol, vol_lookback_months, max_leverage_lo,
-)
-
-# filter both series to the test window before computing metrics
-market_rets, market_dates_test = filter_to_test_window(market_rets_full, market_dates, test_start)
-market_scaled, _ = filter_to_test_window(market_scaled_full, market_dates, test_start)
-
-mkt_m = portfolio_metrics(market_rets, dates = market_dates_test)
-mkt_m_scaled = portfolio_metrics(market_scaled, dates = market_dates_test)
-
-print(f'market months in test window, {len(market_rets)}')
-print(f'market unscaled, sharpe = {mkt_m["sharpe"]:.4f}, ann_ret = {mkt_m["ann_ret"] * 100:.2f}%, ann_vol = {mkt_m["ann_vol"] * 100:.2f}%')
-print(f'market scaled, sharpe = {mkt_m_scaled["sharpe"]:.4f}, ann_ret = {mkt_m_scaled["ann_ret"] * 100:.2f}%, ann_vol = {mkt_m_scaled["ann_vol"] * 100:.2f}%')
+# the market book is reweighted every month, so every month is a rebalance date.
+# the vol overlay uses the same trailing window as the factor portfolios so that
+# the scaled column stays comparable across rows.
+register('market_value_weighted', 'long_only', np.array(market_rets), market_dates,
+	list(range(len(market_rets))), max_leverage_lo)
 
 
-## Sorted factor portfolios (long-short and long-only)
+## Sorted factor portfolios
 
-def sorted_factor_portfolio(factor_name, reverse = False, tail_frac = 0.30):
-    if sorted_dates:
-        start = pd.Timestamp(sorted_dates[0])
-        rset = {
-            d for d in sorted_dates
-            if (
-                (pd.Timestamp(d).year - start.year) * 12
-                + (pd.Timestamp(d).month - start.month)
-            ) % rebalance_freq == 0
-        }
-    else:
-        rset = set()
-    ls_rets, ls_dates, ls_rb_indices = [], [], []
-    lo_rets, lo_dates, lo_rb_indices = [], [], []
-    li_ids, si_ids = set(), set()
-    prev_ls_weights, prev_lo_weights = {}, {}
+for name, (col, reverse, tail_frac) in factor_defs.items():
+	month_fn = lambda eom, name = name: (
+		all_months[eom]['ids'], all_months[eom]['r'],
+		all_months[eom]['me'], all_months[eom].get(name),
+	)
+	sim = run_backtest(sorted_dates, month_fn, tail_frac = tail_frac, reverse = reverse)
+	if len(sim['dates']) == 0:
+		print(f'factor, {name}, no data')
+		continue
+	# the overlay runs on the full sample so the trailing estimator is warmed up
+	# before the test window opens
+	register(name, 'long_short', sim['long_short'], sim['dates'], sim['rb_indices'], max_leverage_ls)
+	register(name, 'long_only', sim['long_only'], sim['dates'], sim['rb_indices'], max_leverage_lo)
 
-    for eom in sorted_dates:
-        m = all_months[eom]
-        ids = m['ids']
-        r = m['r']
-        char_vals = m.get(factor_name)
-        if char_vals is None:
-            continue
 
-        ls_tcv = 0.0
-        lo_tcv = 0.0
+## Fama-MacBeth cross-sectional regression
 
-        if eom in rset:
-            ls_rb_indices.append(len(ls_rets))
-            lo_rb_indices.append(len(lo_rets))
-            valid = np.isfinite(char_vals)
-            if valid.sum() < 10:
-                ls_exit_tcv = portfolio_turnover({}, prev_ls_weights) * tc_bps / 10000.0
-                lo_exit_tcv = portfolio_turnover({}, prev_lo_weights) * tc_bps / 10000.0
-                prev_ls_weights, prev_lo_weights = {}, {}
-                li_ids, si_ids = set(), set()
-                ls_rets.append(-ls_exit_tcv)
-                ls_dates.append(eom)
-                lo_rets.append(-lo_exit_tcv)
-                lo_dates.append(eom)
-                continue
-            vi = ids[valid]
-            vc = char_vals[valid]
-            nq = max(1, int(len(vi) * tail_frac))
-            so = np.argsort(vc)
-            if reverse:
-                li_ids = set(vi[so[:nq]].tolist())
-                si_ids = set(vi[so[::-1][:nq]].tolist())
-            else:
-                li_ids = set(vi[so[::-1][:nq]].tolist())
-                si_ids = set(vi[so[:nq]].tolist())
+fm_betas, fm_dates_used = [], []
+for eom in sorted_dates:
+	m = all_months[eom]
+	valid = np.isfinite(m['r']) & np.isfinite(m['fm_x']).all(axis = 1)
+	if valid.sum() < len(fm_available) + 5:
+		continue
+	x = np.column_stack([np.ones(valid.sum()), m['fm_x'][valid]])
+	try:
+		fm_betas.append(np.linalg.lstsq(x, m['r'][valid], rcond = None)[0])
+		fm_dates_used.append(eom)
+	except np.linalg.LinAlgError:
+		continue
 
-            long_weights = selected_weight_map(ids, li_ids, weight_vals = m['me'], gross = 1.0)
-            short_weights = selected_weight_map(ids, si_ids, weight_vals = m['me'], gross = -1.0)
-            ls_weights = {**long_weights, **short_weights}
-            lo_weights = long_weights
-            ls_tcv = portfolio_turnover(ls_weights, prev_ls_weights) * tc_bps / 10000.0
-            lo_tcv = portfolio_turnover(lo_weights, prev_lo_weights) * tc_bps / 10000.0
+n_coef = 1 + len(fm_available)
+fm_betas = (np.array(fm_betas, dtype = np.float64) if fm_betas
+	else np.empty((0, n_coef), dtype = np.float64))
+n_months_fm = len(fm_betas)
 
-            prev_ls_weights = ls_weights
-            prev_lo_weights = lo_weights
+if n_months_fm > 1:
+	fm_mean = fm_betas.mean(axis = 0)
+	fm_se = fm_betas.std(axis = 0, ddof = 1) / np.sqrt(n_months_fm)
+	fm_tstat = fm_mean / np.maximum(fm_se, 1e-10)
+	fm_pval = 2.0 * (1.0 - stats.t.cdf(np.abs(fm_tstat), df = n_months_fm - 1))
+else:
+	fm_mean = fm_betas.mean(axis = 0) if n_months_fm else np.full(n_coef, np.nan)
+	fm_se = fm_tstat = fm_pval = np.full(n_coef, np.nan)
 
-        if not li_ids:
-            continue
-        lr_mean = selected_portfolio_return(ids, r, li_ids, weight_vals = m['me'])
-        sr_mean = selected_portfolio_return(ids, r, si_ids, weight_vals = m['me'])
-        ls_rets.append(lr_mean - sr_mean - ls_tcv)
-        ls_dates.append(eom)
-        lo_rets.append(lr_mean - lo_tcv)
-        lo_dates.append(eom)
+def stars(p):
+	return '***' if p < 0.01 else '**' if p < 0.05 else '*' if p < 0.10 else ''
 
-    return {
-        'long_short': {'returns': np.array(ls_rets), 'dates': ls_dates, 'rb_indices': ls_rb_indices},
-        'long_only': {'returns': np.array(lo_rets), 'dates': lo_dates, 'rb_indices': lo_rb_indices},
-    }
-
-# run the five factor portfolios and report per factor metrics on the test window
-
-factor_defs = [
-    ('value', False), ('momentum', False), ('profitability', False),
-    ('investment', True), ('size', True),
+fm_coef_table = [
+	{
+		'variable': name,
+		'mean_coef': round(float(fm_mean[i]), 5),
+		'se': round(float(fm_se[i]), 5),
+		't_stat': round(float(fm_tstat[i]), 4),
+		'p_value': round(float(fm_pval[i]), 4),
+		'sig': stars(fm_pval[i]),
+	}
+	for i, name in enumerate(['intercept'] + fm_available)
 ]
 
-factor_results = {}
-rows_for_table = []
-
-for fname, rev in factor_defs:
-    tail_frac = 0.50 if fname == 'size' else 0.30
-    sim = sorted_factor_portfolio(fname, reverse = rev, tail_frac = tail_frac)
-    ls, lo = sim['long_short'], sim['long_only']
-    if len(ls['returns']) == 0:
-        print(f'factor, {fname}, no data')
-        continue
-    # vol overlay applied to the full sample so the trailing window estimator
-    # has full warm up before the test window starts
-    ls_scaled_full = apply_vol_target(ls['returns'], ls['rb_indices'], target_vol, vol_lookback_months, max_leverage_ls)
-    lo_scaled_full = apply_vol_target(lo['returns'], lo['rb_indices'], target_vol, vol_lookback_months, max_leverage_lo)
-
-    # filter both raw and scaled to the test window
-    ls_rets_test, ls_dates_test = filter_to_test_window(ls['returns'], ls['dates'], test_start)
-    lo_rets_test, lo_dates_test = filter_to_test_window(lo['returns'], lo['dates'], test_start)
-    ls_scaled_test, _ = filter_to_test_window(ls_scaled_full, ls['dates'], test_start)
-    lo_scaled_test, _ = filter_to_test_window(lo_scaled_full, lo['dates'], test_start)
-
-    factor_results[fname] = {
-        'returns_ls_unscaled': ls_rets_test, 'returns_ls_scaled': ls_scaled_test,
-        'returns_lo_unscaled': lo_rets_test, 'returns_lo_scaled': lo_scaled_test,
-        'dates_ls': ls_dates_test, 'dates_lo': lo_dates_test,
-        'metrics_ls_unscaled': portfolio_metrics(ls_rets_test, dates = ls_dates_test),
-        'metrics_ls_scaled': portfolio_metrics(ls_scaled_test, dates = ls_dates_test),
-        'metrics_lo_unscaled': portfolio_metrics(lo_rets_test, dates = lo_dates_test),
-        'metrics_lo_scaled': portfolio_metrics(lo_scaled_test, dates = lo_dates_test),
-    }
-    mls = factor_results[fname]['metrics_ls_scaled']
-    mlo = factor_results[fname]['metrics_lo_scaled']
-    rows_for_table.append({
-        'factor': fname,
-        'ls_sharpe': round(mls['sharpe'], 4),
-        'ls_ann_ret': round(mls['ann_ret'] * 100, 2),
-        'ls_ann_vol': round(mls['ann_vol'] * 100, 2),
-        'lo_sharpe': round(mlo['sharpe'], 4),
-        'lo_ann_ret': round(mlo['ann_ret'] * 100, 2),
-        'lo_ann_vol': round(mlo['ann_vol'] * 100, 2),
-    })
-
-factor_table = pd.DataFrame(rows_for_table)
-print(f'Sorted Factor Portfolios, test window from {test_start.date()}, vol targeted')
-print(factor_table.to_string(index = False))
-
-## Fama-macbeth cross-sectional regression
-
-fm_betas = []
-fm_dates_used = []
-
-for eom in sorted_dates:
-    m = all_months[eom]
-    x = m['fm_x']
-    r = m['r']
-    valid = np.isfinite(r)
-    for j in range(x.shape[1]):
-        valid = valid & np.isfinite(x[:, j])
-    if valid.sum() < len(fm_available) + 5:
-        continue
-    x_aug = np.column_stack([np.ones(valid.sum()), x[valid]])
-    try:
-        beta = np.linalg.lstsq(x_aug, r[valid], rcond = None)[0]
-        fm_betas.append(beta)
-        fm_dates_used.append(eom)
-    except np.linalg.LinAlgError:
-        continue
-
-fm_betas = np.array(fm_betas, dtype = np.float64)
-if fm_betas.size == 0:
-    fm_betas = np.empty((0, 1 + len(fm_available)), dtype = np.float64)
-n_months_fm = len(fm_betas)
-if n_months_fm > 0:
-    fm_mean = fm_betas.mean(axis = 0)
-    if n_months_fm > 1:
-        fm_se = fm_betas.std(axis = 0, ddof = 1) / np.sqrt(n_months_fm)
-        fm_tstat = fm_mean / np.maximum(fm_se, 1e-10)
-    else:
-        fm_se = np.full(1 + len(fm_available), np.nan)
-        fm_tstat = np.full(1 + len(fm_available), np.nan)
-else:
-    fm_mean = np.full(1 + len(fm_available), np.nan)
-    fm_se = np.full(1 + len(fm_available), np.nan)
-    fm_tstat = np.full(1 + len(fm_available), np.nan)
-
-coef_names = ['intercept'] + fm_available
-fm_results_table = []
-for i, name in enumerate(coef_names):
-    if n_months_fm > 1 and np.isfinite(fm_tstat[i]):
-        p_val = 2.0 * (1.0 - stats.t.cdf(abs(fm_tstat[i]), df = n_months_fm - 1))
-    else:
-        p_val = np.nan
-    sig = '***' if p_val < 0.01 else '**' if p_val < 0.05 else '*' if p_val < 0.10 else ''
-    fm_results_table.append({
-        'variable': name,
-        'mean_coef': round(float(fm_mean[i]), 5),
-        'se': round(float(fm_se[i]), 5),
-        't_stat': round(float(fm_tstat[i]), 4),
-        'p_value': round(float(p_val), 4),
-        'sig': sig,
-    })
-
-fm_coef_df = pd.DataFrame(fm_results_table)
-print(f'Fama-MacBeth Regression, {n_months_fm} months, {len(fm_available)} characteristics')
-print(fm_coef_df.to_string(index = False))
+print(f'Fama-MacBeth regression, {n_months_fm} months, {len(fm_available)} characteristics')
+print(pd.DataFrame(fm_coef_table).to_string(index = False))
 
 
-## FM predictive portfolio (long-short and long-only)
+## Fama-MacBeth predictive portfolio
 
-min_history = 60
 fm_predictions = {}
+for t in range(min_history, len(fm_dates_used)):
+	beta = fm_betas[:t].mean(axis = 0)
+	eom = fm_dates_used[t]
+	m = all_months[eom]
+	pred = beta[0] + m['fm_x'] @ beta[1:]
+	valid = np.isfinite(pred) & m['fm_x_valid'].all(axis = 1)
+	if valid.sum() < 10:
+		continue
+	fm_predictions[eom] = {
+		'w': pred[valid],
+		'ids': m['ids'][valid],
+		'me': m['me'][valid],
+		'r': m['r'][valid],
+	}
 
-for t_idx in range(min_history, len(fm_dates_used)):
-    beta_avg = fm_betas[:t_idx].mean(axis = 0)
-    pred_date = fm_dates_used[t_idx]
-    m = all_months[pred_date]
-    pred = beta_avg[0] + m['fm_x'] @ beta_avg[1:]
-    fully_observed = m['fm_x_valid'].all(axis = 1)
-    valid = np.isfinite(pred) & fully_observed
-    if valid.sum() < 10:
-        continue
-    fm_predictions[pred_date] = {
-        'w': pred[valid].astype(np.float32),
-        'ids': m['ids'][valid],
-        'me': m['me'][valid].astype(np.float32),
-        'r': m['r'][valid].astype(np.float32),
-    }
-
-print(f'FM predictive portfolio months out-of-sample, {len(fm_predictions)}')
-
-# rank correlation computed on the test window only, matching the metric basis
+# rank correlation is computed on the test window only, matching the metric basis
 fm_corrs = []
-for date_key, p in fm_predictions.items():
-    if date_key < test_start:
-        continue
-    valid_corr = np.isfinite(p['w']) & np.isfinite(p['r'])
-    if valid_corr.sum() < 10:
-        continue
-    result = spearmanr(p['w'][valid_corr], p['r'][valid_corr])
-    c = result.statistic                                             # pyright: ignore[reportAttributeAccessIssue]
-    if not np.isnan(c):
-        fm_corrs.append(float(c))
+for eom, p in fm_predictions.items():
+	if eom < test_start:
+		continue
+	valid = np.isfinite(p['w']) & np.isfinite(p['r'])
+	if valid.sum() < 10:
+		continue
+	c = float(np.asarray(spearmanr(p['w'][valid], p['r'][valid]))[0])
+	if np.isfinite(c):
+		fm_corrs.append(float(c))
 fm_rc = float(np.mean(fm_corrs)) if fm_corrs else 0.0
+
+fm_keys = sorted(fm_predictions.keys())
+fm_sim = run_backtest(
+	fm_keys,
+	lambda eom: (fm_predictions[eom]['ids'], fm_predictions[eom]['r'],
+		fm_predictions[eom]['me'], fm_predictions[eom]['w']),
+	tail_frac = 0.30,
+)
+register('fm_regression', 'long_short', fm_sim['long_short'], fm_sim['dates'],
+	fm_sim['rb_indices'], max_leverage_ls)
+register('fm_regression', 'long_only', fm_sim['long_only'], fm_sim['dates'],
+	fm_sim['rb_indices'], max_leverage_lo)
+
+print(f'FM out-of-sample months, {len(fm_predictions)}')
 print(f'FM rank correlation, {fm_rc:.4f}')
 
-keys_fm = sorted(fm_predictions.keys())
 
-if keys_fm:
-    start_fm = pd.Timestamp(keys_fm[0])
-    rset_fm = {
-        d for d in keys_fm
-        if (
-            (pd.Timestamp(d).year - start_fm.year) * 12
-            + (pd.Timestamp(d).month - start_fm.month)
-        ) % rebalance_freq == 0
-    }
-else:
-    rset_fm = set()
+## Save results
 
-fm_ls_rets, fm_ls_dates, fm_ls_rb_indices = [], [], []
-fm_lo_rets, fm_lo_dates, fm_lo_rb_indices = [], [], []
-li_ids, si_ids = set(), set()
-prev_ls_weights, prev_lo_weights = {}, {}
+by_key = {(s['strategy'], s['portfolio'], s['scaling']): s for s in series}
 
-for eom in keys_fm:
-    p = fm_predictions[eom]
-    w = p['w']
-    ids = p['ids']
-    me = p['me']
-    r = p['r']
+for s in series:
+	np.save(results_dir / f'{s["strategy"]}_{s["portfolio"]}_{s["scaling"]}.npy', s['returns'])
 
-    ls_tcv = 0.0
-    lo_tcv = 0.0
+pd.DataFrame(fm_betas, columns = ['intercept'] + fm_available,
+	index = pd.DatetimeIndex(fm_dates_used)).to_csv(results_dir / 'fm_monthly_betas.csv')
 
-    if eom in rset_fm:
-        fm_ls_rb_indices.append(len(fm_ls_rets))
-        fm_lo_rb_indices.append(len(fm_lo_rets))
-        nq = max(1, int(len(w) * 0.30))
-        so = np.argsort(w)
-        li_ids = set(ids[so[::-1][:nq]].tolist())
-        si_ids = set(ids[so[:nq]].tolist())
+summary_rows = [
+	{
+		'strategy': s['strategy'],
+		'portfolio': s['portfolio'],
+		'scaling': s['scaling'],
+		'sharpe': round(s['metrics']['sharpe'], 4),
+		'se': round(s['metrics']['se_sharpe'], 4),
+		'ann_ret': round(s['metrics']['ann_ret'] * 100, 2),
+		'ann_vol': round(s['metrics']['ann_vol'] * 100, 2),
+		'cum_return': round(s['metrics']['cum_return'] * 100, 2),
+		'max_dd': round(s['metrics']['max_dd'] * 100, 2),
+		'n_obs': s['metrics']['n_obs'],
+	}
+	for s in series
+]
+summary_table = pd.DataFrame(summary_rows)
+summary_table.to_csv(results_dir / 'fama_french_summary.csv', index = False)
 
-        long_weights = selected_weight_map(ids, li_ids, weight_vals = me, gross = 1.0)
-        short_weights = selected_weight_map(ids, si_ids, weight_vals = me, gross = -1.0)
-        ls_weights = {**long_weights, **short_weights}
-        lo_weights = long_weights
-        ls_tcv = portfolio_turnover(ls_weights, prev_ls_weights) * tc_bps / 10000.0
-        lo_tcv = portfolio_turnover(lo_weights, prev_lo_weights) * tc_bps / 10000.0
+per_year_rows = [
+	{
+		'strategy': s['strategy'], 'portfolio': s['portfolio'], 'scaling': s['scaling'],
+		'year': year,
+		'ann_ret': round(ym['ann_ret'] * 100, 4),
+		'ann_vol': round(ym['ann_vol'] * 100, 4),
+		'sharpe': round(ym['sharpe'], 4),
+		'max_dd': round(ym['max_dd'] * 100, 4),
+		'cum_return': round(ym['cum_return'] * 100, 4),
+		'n_obs': ym['n_obs'],
+	}
+	for s in series
+	for year, ym in sorted(s['metrics']['per_year'].items())
+]
+pd.DataFrame(per_year_rows).to_csv(results_dir / 'ff_per_year_metrics.csv', index = False)
 
-        prev_ls_weights = ls_weights
-        prev_lo_weights = lo_weights
+def monthly_rows(s):
+	rets = s['returns']
+	if len(rets) == 0:
+		return []
+	wealth = np.cumprod(1.0 + rets)
+	drawdown = (np.maximum.accumulate(wealth) - wealth) / np.maximum.accumulate(wealth)
+	roll_ret = np.full(len(rets), np.nan)
+	roll_sharpe = np.full(len(rets), np.nan)
+	for i in range(11, len(rets)):
+		window = rets[i - 11:i + 1]
+		mu = float(window.mean() * 12.0)
+		sigma = float(window.std() * np.sqrt(12.0))
+		roll_ret[i] = mu
+		if sigma > 1e-12:
+			roll_sharpe[i] = mu / sigma
 
-    if not li_ids:
-        continue
-    lr_mean = selected_portfolio_return(ids, r, li_ids, weight_vals = me)
-    sr_mean = selected_portfolio_return(ids, r, si_ids, weight_vals = me)
-    fm_ls_rets.append(lr_mean - sr_mean - ls_tcv)
-    fm_ls_dates.append(eom)
-    fm_lo_rets.append(lr_mean - lo_tcv)
-    fm_lo_dates.append(eom)
+	rows = []
+	for i, eom in enumerate(s['dates']):
+		rows.append({
+			'strategy': s['strategy'], 'portfolio': s['portfolio'], 'scaling': s['scaling'],
+			'eom': pd.Timestamp(eom).strftime('%Y-%m-%d'),
+			'return': round(float(rets[i]), 6),
+			'cumulative_wealth': round(float(wealth[i]), 6),
+			'drawdown': round(float(drawdown[i]), 6),
+			'rolling_sharpe_12m': None if np.isnan(roll_sharpe[i]) else round(float(roll_sharpe[i]), 4),
+			'rolling_return_12m': None if np.isnan(roll_ret[i]) else round(float(roll_ret[i]) * 100, 4),
+		})
+	return rows
 
-fm_ls_rets_full = np.array(fm_ls_rets)
-fm_lo_rets_full = np.array(fm_lo_rets)
-fm_ls_scaled_full = apply_vol_target(fm_ls_rets_full, fm_ls_rb_indices, target_vol, vol_lookback_months, max_leverage_ls)
-fm_lo_scaled_full = apply_vol_target(fm_lo_rets_full, fm_lo_rb_indices, target_vol, vol_lookback_months, max_leverage_lo)
-
-# filter the four series to the test window before computing metrics
-fm_ls_rets, fm_ls_dates_test = filter_to_test_window(fm_ls_rets_full, fm_ls_dates, test_start)
-fm_lo_rets, fm_lo_dates_test = filter_to_test_window(fm_lo_rets_full, fm_lo_dates, test_start)
-fm_ls_scaled, _ = filter_to_test_window(fm_ls_scaled_full, fm_ls_dates, test_start)
-fm_lo_scaled, _ = filter_to_test_window(fm_lo_scaled_full, fm_lo_dates, test_start)
-
-fm_ls_unscaled_m = portfolio_metrics(fm_ls_rets, dates = fm_ls_dates_test)
-fm_ls_scaled_m = portfolio_metrics(fm_ls_scaled, dates = fm_ls_dates_test)
-fm_lo_unscaled_m = portfolio_metrics(fm_lo_rets, dates = fm_lo_dates_test)
-fm_lo_scaled_m = portfolio_metrics(fm_lo_scaled, dates = fm_lo_dates_test)
-
-print(f'FM long-short unscaled, sharpe = {fm_ls_unscaled_m["sharpe"]:.4f}')
-print(f'FM long-short scaled, sharpe = {fm_ls_scaled_m["sharpe"]:.4f}, ann_ret = {fm_ls_scaled_m["ann_ret"] * 100:.2f}%, ann_vol = {fm_ls_scaled_m["ann_vol"] * 100:.2f}%')
-print(f'FM long-only unscaled, sharpe = {fm_lo_unscaled_m["sharpe"]:.4f}')
-print(f'FM long-only scaled, sharpe = {fm_lo_scaled_m["sharpe"]:.4f}, ann_ret = {fm_lo_scaled_m["ann_ret"] * 100:.2f}%, ann_vol = {fm_lo_scaled_m["ann_vol"] * 100:.2f}%')
-
-## Save Results
-
-for fname, fr in factor_results.items():
-    np.save(results_dir / f'{fname}_returns_ls_unscaled.npy', fr['returns_ls_unscaled'])
-    np.save(results_dir / f'{fname}_returns_ls_scaled.npy', fr['returns_ls_scaled'])
-    np.save(results_dir / f'{fname}_returns_lo_unscaled.npy', fr['returns_lo_unscaled'])
-    np.save(results_dir / f'{fname}_returns_lo_scaled.npy', fr['returns_lo_scaled'])
-
-np.save(results_dir / 'market_returns.npy', market_rets)
-np.save(results_dir / 'fm_returns_ls_unscaled.npy', fm_ls_rets)
-np.save(results_dir / 'fm_returns_ls_scaled.npy', fm_ls_scaled)
-np.save(results_dir / 'fm_returns_lo_unscaled.npy', fm_lo_rets)
-np.save(results_dir / 'fm_returns_lo_scaled.npy', fm_lo_scaled)
-
-fm_beta_df = pd.DataFrame(
-    fm_betas, columns = ['intercept'] + fm_available,
-    index = pd.DatetimeIndex(fm_dates_used),
-)
-fm_beta_df.to_csv(results_dir / 'fm_monthly_betas.csv')
-
-
-# per year metrics table. one row per (strategy, portfolio, scaling, year).
-# this file is the basis for the year by year diagnostic plots.
-
-per_year_rows = []
-
-def _flush_per_year(strategy, portfolio, scaling, metrics):
-    py = metrics.get('per_year', {}) if isinstance(metrics, dict) else {}
-    for year in sorted(py.keys()):
-        ym = py[year]
-        per_year_rows.append({
-            'strategy': strategy, 'portfolio': portfolio,
-            'scaling': scaling, 'year': int(year),
-            'ann_ret': round(float(ym['ann_ret']) * 100, 4),
-            'ann_vol': round(float(ym['ann_vol']) * 100, 4),
-            'sharpe': round(float(ym['sharpe']), 4),
-            'max_dd': round(float(ym['max_dd']) * 100, 4),
-            'cum_return': round(float(ym['cum_return']) * 100, 4),
-            'n_obs': int(ym['n_obs']),
-        })
-
-_flush_per_year('market_value_weighted', 'long_only', 'unscaled', mkt_m)
-_flush_per_year('market_value_weighted', 'long_only', 'scaled', mkt_m_scaled)
-
-for fname, fr in factor_results.items():
-    _flush_per_year(fname, 'long_short', 'unscaled', fr['metrics_ls_unscaled'])
-    _flush_per_year(fname, 'long_short', 'scaled', fr['metrics_ls_scaled'])
-    _flush_per_year(fname, 'long_only', 'unscaled', fr['metrics_lo_unscaled'])
-    _flush_per_year(fname, 'long_only', 'scaled', fr['metrics_lo_scaled'])
-
-_flush_per_year('fm_regression', 'long_short', 'unscaled', fm_ls_unscaled_m)
-_flush_per_year('fm_regression', 'long_short', 'scaled', fm_ls_scaled_m)
-_flush_per_year('fm_regression', 'long_only', 'unscaled', fm_lo_unscaled_m)
-_flush_per_year('fm_regression', 'long_only', 'scaled', fm_lo_scaled_m)
-
-per_year_df = pd.DataFrame(per_year_rows)
-per_year_df.to_csv(results_dir / 'ff_per_year_metrics.csv', index = False)
-print(f'per year metrics saved, {len(per_year_df)} rows')
-
-
-def _build_monthly_rows(strategy, portfolio, scaling, rets, dates):
-    rets = np.asarray(rets, dtype = np.float64)
-    if len(rets) == 0:
-        return []
-    cum_wealth = np.cumprod(1.0 + rets)
-    peak = np.maximum.accumulate(cum_wealth)
-    drawdown = (peak - cum_wealth) / peak
-
-    rolling_sharpe = np.full(len(rets), np.nan)
-    rolling_ret = np.full(len(rets), np.nan)
-    for i in range(11, len(rets)):
-        w = rets[i - 11:i + 1]
-        mu = float(w.mean() * 12.0)
-        sigma = float(w.std() * np.sqrt(12.0))
-        rolling_ret[i] = mu
-        if sigma > 1e-12:
-            rolling_sharpe[i] = mu / sigma
-
-    rows = []
-    for i, eom in enumerate(dates):
-        rows.append({
-            'strategy': strategy,
-            'portfolio': portfolio,
-            'scaling': scaling,
-            'eom': pd.Timestamp(eom).strftime('%Y-%m-%d'),
-            'return': round(float(rets[i]), 6),
-            'cumulative_wealth': round(float(cum_wealth[i]), 6),
-            'drawdown': round(float(drawdown[i]), 6),
-            'rolling_sharpe_12m': (
-                None if np.isnan(rolling_sharpe[i]) else round(float(rolling_sharpe[i]), 4)
-            ),
-            'rolling_return_12m': (
-                None if np.isnan(rolling_ret[i]) else round(float(rolling_ret[i]) * 100, 4)
-            ),
-        })
-    return rows
-
-monthly_rows = []
-monthly_rows.extend(_build_monthly_rows('market_value_weighted', 'long_only', 'unscaled', market_rets, market_dates_test))
-monthly_rows.extend(_build_monthly_rows('market_value_weighted', 'long_only', 'scaled', market_scaled, market_dates_test))
-
-for fname, fr in factor_results.items():
-    monthly_rows.extend(_build_monthly_rows(fname, 'long_short', 'unscaled', fr['returns_ls_unscaled'], fr['dates_ls']))
-    monthly_rows.extend(_build_monthly_rows(fname, 'long_short', 'scaled', fr['returns_ls_scaled'], fr['dates_ls']))
-    monthly_rows.extend(_build_monthly_rows(fname, 'long_only', 'unscaled', fr['returns_lo_unscaled'], fr['dates_lo']))
-    monthly_rows.extend(_build_monthly_rows(fname, 'long_only', 'scaled', fr['returns_lo_scaled'], fr['dates_lo']))
-
-monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_short', 'unscaled', fm_ls_rets, fm_ls_dates_test))
-monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_short', 'scaled', fm_ls_scaled, fm_ls_dates_test))
-monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_only', 'unscaled', fm_lo_rets, fm_lo_dates_test))
-monthly_rows.extend(_build_monthly_rows('fm_regression', 'long_only', 'scaled', fm_lo_scaled, fm_lo_dates_test))
-
-per_month_df = pd.DataFrame(monthly_rows)
+per_month_df = pd.DataFrame([row for s in series for row in monthly_rows(s)])
 per_month_df.to_csv(results_dir / 'ff_per_month_metrics.csv', index = False)
-print(f'per month metrics saved, {len(per_month_df)} rows')
-
-
-def _strip_per_year(m):
-    if not isinstance(m, dict):
-        return m
-    return {k: v for k, v in m.items() if k != 'per_year'}
 
 summary = {
-    'fm_characteristics': fm_available,
-    'test_start': str(test_start.date()),
-    'market_long_only_unscaled': _strip_per_year(mkt_m),
-    'market_long_only_scaled': _strip_per_year(mkt_m_scaled),
-    'factors': {
-        f: {
-            'long_short_scaled': _strip_per_year(fr['metrics_ls_scaled']),
-            'long_short_unscaled': _strip_per_year(fr['metrics_ls_unscaled']),
-            'long_only_scaled': _strip_per_year(fr['metrics_lo_scaled']),
-            'long_only_unscaled': _strip_per_year(fr['metrics_lo_unscaled']),
-        }
-        for f, fr in factor_results.items()
-    },
-    'fm_regression': {
-        'n_months': n_months_fm, 'n_chars': len(fm_available),
-        'characteristics': fm_available, 'coefficients': fm_results_table,
-    },
-    'fm_portfolio': {
-        'long_short_unscaled': _strip_per_year(fm_ls_unscaled_m),
-        'long_short_scaled': _strip_per_year(fm_ls_scaled_m),
-        'long_only_unscaled': _strip_per_year(fm_lo_unscaled_m),
-        'long_only_scaled': _strip_per_year(fm_lo_scaled_m),
-        'rank_corr': fm_rc, 'n_oos_months': len(fm_predictions),
-    },
+	'test_start': str(test_start.date()),
+	'fm_characteristics': fm_available,
+	'strategies': {
+		f'{s["strategy"]}_{s["portfolio"]}_{s["scaling"]}':
+			{k: v for k, v in s['metrics'].items() if k != 'per_year'}
+		for s in series
+	},
+	'fm_regression': {
+		'n_months': n_months_fm,
+		'characteristics': fm_available,
+		'coefficients': fm_coef_table,
+		'rank_corr': fm_rc,
+		'n_oos_months': len(fm_predictions),
+	},
 }
-with open(results_dir / 'ff_summary.json', 'w') as fs:
-    json.dump(summary, fs, indent = 2, default = float)
-print(f'summary json saved')
+with open(results_dir / 'ff_summary.json', 'w') as f:
+	json.dump(summary, f, indent = 2, default = float)
 
-def _row(strategy, portfolio, scaling, m):
-    return {
-        'strategy': strategy, 'portfolio': portfolio,
-        'scaling': scaling, 'sharpe': round(m['sharpe'], 4),
-        'se': round(m['se_sharpe'], 4), 'ann_ret': round(m['ann_ret'] * 100, 2),
-        'ann_vol': round(m['ann_vol'] * 100, 2), 'cum_return': round(m['cum_return'] * 100, 2),
-        'max_dd': round(m['max_dd'] * 100, 2), 'n_obs': m['n_obs'],
-    }
-
-
-summary_rows = []
-for scaling, mk in [
-    ('unscaled', mkt_m),
-    ('scaled', mkt_m_scaled),
-]:
-    summary_rows.append(_row('market_value_weighted', 'long_only', scaling, mk))
-
-for fname in ['value', 'momentum', 'profitability', 'investment', 'size']:
-    if fname not in factor_results:
-        continue
-    for portfolio, scaling, mkey in [
-        ('long_short', 'unscaled', 'metrics_ls_unscaled'),
-        ('long_short', 'scaled', 'metrics_ls_scaled'),
-        ('long_only', 'unscaled', 'metrics_lo_unscaled'),
-        ('long_only', 'scaled', 'metrics_lo_scaled'),
-    ]:
-        summary_rows.append(_row(fname, portfolio, scaling, factor_results[fname][mkey]))
-
-for portfolio, scaling, m in [
-    ('long_short', 'unscaled', fm_ls_unscaled_m),
-    ('long_short', 'scaled', fm_ls_scaled_m),
-    ('long_only', 'unscaled', fm_lo_unscaled_m),
-    ('long_only', 'scaled', fm_lo_scaled_m),
-]:
-    summary_rows.append(_row('fm_regression', portfolio, scaling, m))
-
-summary_table = pd.DataFrame(summary_rows)
-print('Fama-French Benchmark, EM Universe, Unscaled and vol-targeted')
+print('Fama-French benchmark, EM universe, unscaled and vol targeted')
 print(summary_table.to_string(index = False))
-print(f'FM rank correlation, {fm_rc:.4f}')
-
-summary_table.to_csv(results_dir / 'fama_french_summary.csv', index = False)
-print('summary saved, fama_french_summary.csv')
-
-
-factor_order = ['value', 'momentum', 'profitability', 'investment', 'size']
-# figure 1, volatility targeted cumulative wealth
-fig, axes = plt.subplots(1, 2, figsize = (12, 4))
-
-ax = axes[0]
-ax.plot(np.cumprod(1 + fm_ls_scaled), label = 'FM Long Short')
-ax.plot(np.cumprod(1 + fm_lo_scaled), label = 'FM Long Only')
-ax.plot(np.cumprod(1 + market_scaled), label = 'Market', linestyle = '--')
-ax.set_xlabel('Months from Start of Sample')
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Fama and MacBeth Portfolios, Volatility Targeted')
-ax.legend(frameon = False)
-
-ax = axes[1]
-for factor in factor_order:
-    if factor in factor_results:
-        ax.plot(np.cumprod(1 + factor_results[factor]['returns_lo_scaled']), label = factor.title())
-ax.set_xlabel('Months from Start of Sample')
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Single Factor Long Only, Volatility Targeted')
-ax.legend(frameon = False)
-
-fig.tight_layout()
-plt.show()
-
-
-# figure 2, unscaled cumulative wealth
-fig, axes = plt.subplots(1, 2, figsize = (12, 4))
-
-ax = axes[0]
-ax.plot(np.cumprod(1 + fm_ls_rets), label = 'FM Long Short')
-ax.plot(np.cumprod(1 + fm_lo_rets), label = 'FM Long Only')
-ax.plot(np.cumprod(1 + np.asarray(market_rets)), label = 'Market', linestyle = '--')
-ax.set_xlabel('Months from Start of Sample')
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Fama and MacBeth Portfolios, Unscaled')
-ax.legend(frameon = False)
-
-ax = axes[1]
-for factor in factor_order:
-    if factor in factor_results:
-        ax.plot(np.cumprod(1 + factor_results[factor]['returns_lo_unscaled']), label = factor.title())
-ax.set_xlabel('Months')
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Single Factor Long Only, Unscaled')
-ax.legend(frameon = False)
-
-fig.tight_layout()
-plt.show()
-
-
-# figure 3, volatility targeted against unscaled on the same axes.
-fig, axes = plt.subplots(1, 2, figsize = (12, 4))
-
-ax = axes[0]
-ax.plot(np.cumprod(1 + fm_ls_scaled), label = 'FM Long Short, Scaled', color = 'C0')
-ax.plot(np.cumprod(1 + fm_ls_rets), label = 'FM Long Short, Unscaled', color = 'C0', linestyle = '--')
-ax.plot(np.cumprod(1 + fm_lo_scaled), label = 'FM Long Only, Scaled', color = 'C1')
-ax.plot(np.cumprod(1 + fm_lo_rets), label = 'FM Long Only, Unscaled', color = 'C1', linestyle = '--')
-ax.plot(np.cumprod(1 + market_scaled), label = 'Market, Scaled', color = 'C2')
-ax.plot(np.cumprod(1 + np.asarray(market_rets)), label = 'Market, Unscaled', color = 'C2', linestyle = '--')
-ax.set_xlabel('Months from Start of Sample')
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Fama and MacBeth Portfolios, Scaled and Unscaled')
-ax.legend(frameon = False, fontsize = 8, loc = 'upper left')
-
-ax = axes[1]
-for k, factor in enumerate(factor_order):
-    if factor in factor_results:
-        col = f'C{k}'
-        ax.plot(np.cumprod(1 + factor_results[factor]['returns_lo_scaled']), label = factor.title(), color = col)
-        ax.plot(np.cumprod(1 + factor_results[factor]['returns_lo_unscaled']), color = col, linestyle = '--')
-ax.set_xlabel('Month')
-ax.set_ylabel('Cumulative Wealth')
-ax.set_title('Single Factor Long Only, Solid Scaled, Dashed Unscaled')
-ax.legend(frameon = False, fontsize = 9, loc = 'upper left')
-
-fig.tight_layout()
-plt.show()
+print(f'saved, {len(per_month_df)} monthly rows and {len(per_year_rows)} annual rows')
