@@ -30,16 +30,17 @@ class Config:
     country_lookup_path: Path = Path("data/processed/country_lookup.parquet")
 
     d_model: int = 64
-    n_heads: int = 4
-    n_layers: int = 2
     d_ff: int = 128
     dropout: float = 0.1
-    top_k_attention: int = 50
     ple_num_bins: int = 16
     periodic_num_freq: int = 32
 
     n_mlp_layers: int = 2
+    path2_n_layers: int = 2
+    path2_n_heads: int = 1
+    path2_d_ff: int = 256
     lambda_aux: float = 0.3
+    lambda_aux2: float = 0.3
     min_firms_attention: int = 10
 
     target_vol: float = 0.10
@@ -172,6 +173,15 @@ def load_dataset(path, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, coun
             df[col] = df[col].fillna(0.0)
     if has_market_cap and df["me"].isna().any():
         df["me"] = df["me"].fillna(0.0)
+    # winsorise the realised returns to the benchmark bands so the transformer
+    # is evaluated on the same return series as the benchmark models. the one
+    # month return is clipped to [-1, 1] and the compounded six month return to
+    # [-2, 2], matching load_universe in benchmark_common (ret_clip_low = -1.0,
+    # ret_clip_high = 1.0, and the six month band widened by a factor of two)
+    if "target_1m" in df.columns:
+        df["target_1m"] = df["target_1m"].clip(lower=-1.0, upper=1.0)
+    if "target_6m" in df.columns:
+        df["target_6m"] = df["target_6m"].clip(lower=-2.0, upper=2.0)
     return CrossSectionalDataset(df, k0_cols, k1_cols, k0_miss, k1_miss, target_col_list, country_lookup, has_market_cap=has_market_cap)
 
 
@@ -348,14 +358,19 @@ class FirmScoreHead(nn.Module):
         return self.net(z).squeeze(-1)
 
 
-def _cross_sectional_soft_norm(z_c, temperature=2.0):
-    n = z_c.shape[0]
-    if n <= 1:
-        return torch.zeros_like(z_c)
-    mean = z_c.mean(dim=0, keepdim=True)
-    std = z_c.std(dim=0, keepdim=True, unbiased=False)
-    z_score = (z_c - mean) / (std + 1e-6)
-    return 0.5 * torch.tanh(z_score / temperature)
+class Path2Transformer(nn.Module):
+    def __init__(self, d_in, n_heads, n_layers, d_ff):
+        super().__init__()
+        self.blocks = nn.ModuleList([TransformerBlock(d_in, n_heads, d_ff) for _ in range(n_layers)])
+        self.lam = nn.Parameter(torch.randn(d_in) * (1.0 / d_in))
+
+    def forward(self, x):
+        y = x
+        all_attn = []
+        for block in self.blocks:
+            y, attn_w = block(y)
+            all_attn.append(attn_w)
+        return y @ self.lam, all_attn
 
 
 class DualPathTransformer(nn.Module):
@@ -376,9 +391,7 @@ class DualPathTransformer(nn.Module):
 
         self.base_head_6m = FirmScoreHead(config.d_model, config.d_ff, config.n_mlp_layers, config.dropout)
 
-        self.blocks = nn.ModuleList([TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout) for _ in range(config.n_layers)])
-
-        self.adj_head_6m = nn.Sequential(nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1))
+        self.path2_net = Path2Transformer(n_k0 + n_k1, config.path2_n_heads, config.path2_n_layers, config.path2_d_ff)
 
         self.min_firms = config.min_firms_attention
 
@@ -396,21 +409,19 @@ class DualPathTransformer(nn.Module):
 
         base_6m = self.base_head_6m(z)
 
-        adj_6m = torch.zeros_like(base_6m)
+        x2 = torch.cat([k0, k1], dim=-1)
+        path2_6m = torch.zeros_like(base_6m)
         all_attn = []
 
         for cid in country_ids.unique():
             mask = country_ids == cid
             if mask.sum() < self.min_firms:
                 continue
-            z_c = z[mask]
-            z_c = _cross_sectional_soft_norm(z_c)
-            for block in self.blocks:
-                z_c, attn_w = block(z_c)
-                all_attn.append(attn_w)
-            adj_6m[mask] = self.adj_head_6m(z_c).squeeze(-1)
+            score_c, attn_c = self.path2_net(x2[mask])
+            path2_6m[mask] = score_c
+            all_attn.extend(attn_c)
 
-        return {"scores_6m": base_6m + adj_6m, "base_6m": base_6m, "attn": all_attn, "agg": agg_info}
+        return {"scores_6m": base_6m + path2_6m, "base_6m": base_6m, "path2_6m": path2_6m, "attn": all_attn, "agg": agg_info}
 
 
 def _renorm_over_valid(weights, valid):
@@ -523,16 +534,42 @@ def _seed_vol_history(models, val_dataset, config, rebalance_freq, leg_kind, sco
             raw_np = raw.numpy()
             valid_np = valid.numpy()
             if leg_kind == "long_only":
-                w = F.softmax(scores.cpu(), dim=0).numpy()
+                # seed with the same capped softmax book the test simulation trades,
+                # so the volatility estimate that primes the overlay is measured on the
+                # construction it is actually applied to rather than an uncapped proxy
+                scores_cpu = scores.cpu()
+                w = _capped_softmax_weights(scores_cpu, config.max_position_weight)
                 w = _renorm_over_valid(w, valid_np)
-                long_ret = float(sum(w[fi] * raw_np[fi] for fi in range(n_firms) if valid_np[fi]))
+                w_np = w.numpy().astype(np.float64)
+                long_ret = 0.0
+                for fi in range(n_firms):
+                    r = float(raw_np[fi]) if valid_np[fi] else 0.0
+                    long_ret += w_np[fi] * r
                 returns.append(long_ret)
             else:
-                mean_s = scores.mean().item()
-                long_r = [raw_np[fi] for fi in range(n_firms) if scores[fi].item() > mean_s and valid_np[fi]]
-                short_r = [raw_np[fi] for fi in range(n_firms) if scores[fi].item() <= mean_s and valid_np[fi]]
-                long_ret = sum(long_r) / max(len(long_r), 1) if long_r else 0.0
-                short_ret = sum(short_r) / max(len(short_r), 1) if short_r else 0.0
+                # seed the long short overlay with the identical mean split, capped
+                # softmax, demeaned construction used at test time, in place of the
+                # equal weighted proxy that understated the concentrated book volatility
+                scores_cpu = scores.cpu()
+                mean_s = scores_cpu.mean()
+                long_mask = scores_cpu > mean_s
+                short_mask = ~long_mask
+                long_idx_np = long_mask.nonzero(as_tuple=True)[0].numpy()
+                short_idx_np = short_mask.nonzero(as_tuple=True)[0].numpy()
+                long_w = _capped_softmax_weights(scores_cpu[long_mask] - mean_s, config.max_position_weight)
+                short_w = _capped_softmax_weights(mean_s - scores_cpu[short_mask], config.max_position_weight)
+                long_w = _renorm_over_valid(long_w, valid_np[long_idx_np])
+                short_w = _renorm_over_valid(short_w, valid_np[short_idx_np])
+                long_w_np = long_w.numpy().astype(np.float64)
+                short_w_np = short_w.numpy().astype(np.float64)
+                long_ret = 0.0
+                for i, fi in enumerate(long_idx_np):
+                    r = float(raw_np[fi]) if valid_np[fi] else 0.0
+                    long_ret += long_w_np[i] * r
+                short_ret = 0.0
+                for i, fi in enumerate(short_idx_np):
+                    r = float(raw_np[fi]) if valid_np[fi] else 0.0
+                    short_ret += short_w_np[i] * r
                 returns.append(long_ret - short_ret)
     return returns[-n_vol_periods:] if returns else []
 
@@ -1575,7 +1612,7 @@ for variant_name in all_results:
     cfg.encoding_variant = variant_name
 
     stored_cfg = all_results[variant_name].get("config", {})
-    for field in ("d_model", "n_heads", "n_layers", "d_ff", "dropout", "top_k_attention", "n_mlp_layers", "periodic_num_freq", "ple_num_bins", "min_firms_attention"):
+    for field in ("d_model", "d_ff", "dropout", "n_mlp_layers", "path2_n_layers", "path2_n_heads", "path2_d_ff", "periodic_num_freq", "ple_num_bins", "min_firms_attention"):
         if field in stored_cfg:
             setattr(cfg, field, stored_cfg[field])
 

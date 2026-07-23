@@ -38,16 +38,17 @@ class Config:
     missing_col_threshold: float = 0.30
 
     d_model: int = 64
-    n_heads: int = 4
-    n_layers: int = 2
     d_ff: int = 128
     dropout: float = 0.1
-    top_k_attention: int = 50
     ple_num_bins: int = 16
     periodic_num_freq: int = 32
 
     n_mlp_layers: int = 2
+    path2_n_layers: int = 2
+    path2_n_heads: int = 1
+    path2_d_ff: int = 256
     lambda_aux: float = 0.3
+    lambda_aux2: float = 0.3
     min_firms_attention: int = 30
     warmup_epochs: int = 5
 
@@ -370,14 +371,20 @@ class FirmScoreHead(nn.Module):
         return self.net(z).squeeze(-1)
 
 
-def _cross_sectional_soft_norm(z_c, temperature=2.0):
-    n = z_c.shape[0]
-    if n <= 1:
-        return torch.zeros_like(z_c)
-    mean = z_c.mean(dim=0, keepdim=True)
-    std = z_c.std(dim=0, keepdim=True, unbiased=False)
-    z_score = (z_c - mean) / (std + 1e-6)
-    return 0.5 * torch.tanh(z_score / temperature)
+class Path2Transformer(nn.Module):
+
+    def __init__(self, d_in, n_heads, n_layers, d_ff):
+        super().__init__()
+        self.blocks = nn.ModuleList([TransformerBlock(d_in, n_heads, d_ff) for _ in range(n_layers)])
+        self.lam = nn.Parameter(torch.randn(d_in) * (1.0 / d_in))
+
+    def forward(self, x):
+        y = x
+        all_attn = []
+        for block in self.blocks:
+            y, attn_w = block(y)
+            all_attn.append(attn_w)
+        return y @ self.lam, all_attn
 
 
 class DualPathTransformer(nn.Module):
@@ -399,9 +406,7 @@ class DualPathTransformer(nn.Module):
 
         self.base_head_6m = FirmScoreHead(config.d_model, config.d_ff, config.n_mlp_layers, config.dropout)
 
-        self.blocks = nn.ModuleList([TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout) for _ in range(config.n_layers)])
-
-        self.adj_head_6m = nn.Sequential(nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1))
+        self.path2_net = Path2Transformer(n_k0 + n_k1, config.path2_n_heads, config.path2_n_layers, config.path2_d_ff)
 
         self.min_firms = config.min_firms_attention
 
@@ -422,21 +427,19 @@ class DualPathTransformer(nn.Module):
 
         base_6m = self.base_head_6m(z)
 
-        adj_6m = torch.zeros_like(base_6m)
+        x2 = torch.cat([k0, k1], dim=-1)
+        path2_6m = torch.zeros_like(base_6m)
         all_attn = []
 
         for cid in country_ids.unique():
             mask = country_ids == cid
             if mask.sum() < self.min_firms:
                 continue
-            z_c = z[mask]
-            z_c = _cross_sectional_soft_norm(z_c)
-            for block in self.blocks:
-                z_c, attn_w = block(z_c)
-                all_attn.append(attn_w)
-            adj_6m[mask] = self.adj_head_6m(z_c).squeeze(-1)
+            score_c, attn_c = self.path2_net(x2[mask])
+            path2_6m[mask] = score_c
+            all_attn.extend(attn_c)
 
-        return {"scores_6m": base_6m + adj_6m, "base_6m": base_6m, "adj_6m": adj_6m, "attn": all_attn, "agg": agg_info}
+        return {"scores_6m": base_6m + path2_6m, "base_6m": base_6m, "path2_6m": path2_6m, "attn": all_attn, "agg": agg_info}
 
 
 def _differentiable_long_short_return(scores, returns, valid_mask):
@@ -468,9 +471,11 @@ def compute_msrr_loss(output, targets, valid_masks, config):
         return zero, 0.0, 0.0
     r_pf = _differentiable_long_short_return(output["scores_6m"], target, valid)
     r_base = _differentiable_long_short_return(output["base_6m"], target, valid)
+    r_path2 = _differentiable_long_short_return(output["path2_6m"], target, valid)
     main_loss = (1.0 - r_pf).pow(2)
     aux_loss = (1.0 - r_base).pow(2)
-    total = main_loss + config.lambda_aux * aux_loss
+    aux2_loss = (1.0 - r_path2).pow(2)
+    total = main_loss + config.lambda_aux * aux_loss + config.lambda_aux2 * aux2_loss
     return total, main_loss.item(), aux_loss.item()
 
 
@@ -549,7 +554,7 @@ def evaluate(model, dataset, config):
     total_loss = 0.0
     total_corr_6m = 0.0
     total_corr_base_6m = 0.0
-    total_corr_adj_6m = 0.0
+    total_corr_path2_6m = 0.0
     n_months = 0
     for idx in range(len(dataset)):
         batch = dataset[idx]
@@ -567,11 +572,11 @@ def evaluate(model, dataset, config):
 
         total_corr_6m += compute_rank_correlation(output["scores_6m"], targets["target_6m"], valid_masks["target_6m"])
         total_corr_base_6m += compute_rank_correlation(output["base_6m"], targets["target_6m"], valid_masks["target_6m"])
-        total_corr_adj_6m += compute_rank_correlation(output["adj_6m"], targets["target_6m"], valid_masks["target_6m"])
+        total_corr_path2_6m += compute_rank_correlation(output["path2_6m"], targets["target_6m"], valid_masks["target_6m"])
         n_months += 1
 
     n = max(n_months, 1)
-    return {"loss": total_loss / n, "rank_corr_6m": total_corr_6m / n, "rank_corr_base_6m": total_corr_base_6m / n, "rank_corr_adj_6m": total_corr_adj_6m / n}
+    return {"loss": total_loss / n, "rank_corr_6m": total_corr_6m / n, "rank_corr_base_6m": total_corr_base_6m / n, "rank_corr_path2_6m": total_corr_path2_6m / n}
 
 
 def _model_parameter_breakdown(model):
@@ -623,13 +628,12 @@ def _capture_tensor_shapes(model, config):
         "k0_agg": "K0 attention-weighted aggregation to firm token",
         "k1_agg": "K1 attention-weighted aggregation to firm token",
         "base_head_6m": "Per firm base score head, 6 month horizon",
-        "adj_head_6m": "Cross sectional adjustment head, 6 month horizon",
     }
     for name, module in model.named_children():
         desc = submodule_descriptions.get(name, "")
-        if name == "blocks":
-            for i, block in enumerate(module):
-                handles.append(block.register_forward_hook(_make_hook(f"blocks.{i}", "Cross sectional Transformer block")))
+        if name == "path2_net":
+            for i, block in enumerate(module.blocks):
+                handles.append(block.register_forward_hook(_make_hook(f"path2_net.blocks.{i}", "Path 2 cross sectional Transformer block")))
         elif desc:
             handles.append(module.register_forward_hook(_make_hook(name, desc)))
 
@@ -670,10 +674,10 @@ def train_variant(config, seed_idx=0):
         [
             bar,
             f"Variant {variant}  Seed {seed_idx}",
-            f"Architecture d_model={config.d_model}  n_heads={config.n_heads}  " f"n_layers={config.n_layers}  d_ff={config.d_ff}  dropout={config.dropout}",
-            f"n_mlp_layers={config.n_mlp_layers}  " f"lambda_aux={config.lambda_aux}  top_k_attention={config.top_k_attention}  " f"min_firms_attention={config.min_firms_attention}",
+            f"Path 1 d_model={config.d_model}  d_ff={config.d_ff}  n_mlp_layers={config.n_mlp_layers}  dropout={config.dropout}",
+            f"Path 2 path2_n_layers={config.path2_n_layers}  path2_n_heads={config.path2_n_heads}  path2_d_ff={config.path2_d_ff}  min_firms_attention={config.min_firms_attention}",
             f"Optimiser lr={config.learning_rate:.2e}  wd={config.weight_decay:.2e}  " f"grad_clip={config.grad_clip}  patience={config.patience}",
-            f"Loss MSRR (1 - r_pf)^2 + lambda_aux (1 - r_base)^2  lambda_aux={config.lambda_aux}",
+            f"Loss MSRR (1 - r_pf)^2 + lambda_aux (1 - r_base)^2 + lambda_aux2 (1 - r_path2)^2  lambda_aux={config.lambda_aux}  lambda_aux2={config.lambda_aux2}",
         ]
     )
 
@@ -687,7 +691,7 @@ def train_variant(config, seed_idx=0):
 
     _block([f" Data train_months={len(train_ds)}  val_months={len(val_ds)}", f" Model {n_params:,} trainable parameters", bar])
 
-    col_header = f"{'Epoch':>5}{'TrnTotal':>9}{'TrnMain':>9}{'TrnAux':>9}  " f"{'ValLoss':>9}{'Corr6m':>8}{'Base6m':>8}{'Adj6m':>8}  " f"{'LR':>9}{'GNorm':>8}"
+    col_header = f"{'Epoch':>5}{'TrnTotal':>9}{'TrnMain':>9}{'TrnAux':>9}  " f"{'ValLoss':>9}{'Corr6m':>8}{'Base6m':>8}{'Path26m':>8}  " f"{'LR':>9}{'GNorm':>8}"
     print(col_header)
     print(sep)
     sys.stdout.flush()
@@ -699,7 +703,7 @@ def train_variant(config, seed_idx=0):
     best_epoch = 1
     best_val_metrics = None
     patience_counter = 0
-    history = {"train_loss": [], "train_main": [], "train_aux": [], "val_loss": [], "val_corr_6m": [], "val_base_corr_6m": [], "val_adj_corr_6m": []}
+    history = {"train_loss": [], "train_main": [], "train_aux": [], "val_loss": [], "val_corr_6m": [], "val_base_corr_6m": [], "val_path2_corr_6m": []}
     weights_path = config.results_dir / f"weights_{variant}_{seed_tag}.safetensors"
     scaler = torch.GradScaler(device.type)
 
@@ -716,7 +720,7 @@ def train_variant(config, seed_idx=0):
         val_loss = val_metrics["loss"]
         val_corr_6m = val_metrics["rank_corr_6m"]
         val_base_corr_6m = val_metrics["rank_corr_base_6m"]
-        val_adj_corr_6m = val_metrics["rank_corr_adj_6m"]
+        val_path2_corr_6m = val_metrics["rank_corr_path2_6m"]
 
         if epoch > config.warmup_epochs:
             scheduler.step(val_loss)
@@ -727,7 +731,7 @@ def train_variant(config, seed_idx=0):
         history["val_loss"].append(val_loss)
         history["val_corr_6m"].append(val_corr_6m)
         history["val_base_corr_6m"].append(val_base_corr_6m)
-        history["val_adj_corr_6m"].append(val_adj_corr_6m)
+        history["val_path2_corr_6m"].append(val_path2_corr_6m)
 
         current_lr = optimizer.param_groups[0]["lr"]
         is_best = epoch > config.warmup_epochs and val_loss < best_val_loss - 1e-5
@@ -735,7 +739,7 @@ def train_variant(config, seed_idx=0):
 
         row = (
             f"{epoch:>5}{train_loss:>9.6f}{train_main:>9.6f}{train_aux:>9.6f}  "
-            f"{val_loss:>9.6f}{val_corr_6m:>8.4f}{val_base_corr_6m:>8.4f}{val_adj_corr_6m:>8.4f}  "
+            f"{val_loss:>9.6f}{val_corr_6m:>8.4f}{val_base_corr_6m:>8.4f}{val_path2_corr_6m:>8.4f}  "
             f"{current_lr:>9.2e}{grad_norm:>8.4f}{marker}"
         )
         print(row)
@@ -773,7 +777,7 @@ def train_variant(config, seed_idx=0):
             f"{'Test MSRR loss':<22} {test_metrics['loss']:>10.6f}",
             f"{'Test rank corr 6m':<22}{test_metrics['rank_corr_6m']:>10.4f}",
             f"{'Test base corr 6m':<22}{test_metrics['rank_corr_base_6m']:>10.4f}",
-            f"{'Test adj corr 6m':<22}{test_metrics['rank_corr_adj_6m']:>10.4f}",
+            f"{'Test path2 corr 6m':<22}{test_metrics['rank_corr_path2_6m']:>10.4f}",
             sep,
             f"Best val loss {best_val_loss:.6f}  (epoch {best_epoch})",
             f"Stopped epoch {final_epoch}",
@@ -786,12 +790,14 @@ def train_variant(config, seed_idx=0):
     model_architecture = {
         "encoding_variant": variant,
         "d_model": config.d_model,
-        "n_heads": config.n_heads,
-        "n_layers": config.n_layers,
         "d_ff": config.d_ff,
         "dropout": config.dropout,
-        "top_k_attention": config.top_k_attention,
         "n_mlp_layers": config.n_mlp_layers,
+        "path2_n_layers": config.path2_n_layers,
+        "path2_n_heads": config.path2_n_heads,
+        "path2_d_ff": config.path2_d_ff,
+        "lambda_aux": config.lambda_aux,
+        "lambda_aux2": config.lambda_aux2,
         "min_firms_attention": config.min_firms_attention,
         "n_k0_characteristics": len(k0_chars),
         "n_k1_characteristics": len(k1_chars),
@@ -843,14 +849,14 @@ for variant_name in ["linear", "per_feature", "ple", "periodic", "fourier"]:
         with open(hpt_path, "r") as f:
             best_params = json.load(f)
         cfg.d_model = best_params["d_model"]
-        cfg.n_heads = best_params["n_heads"]
-        cfg.n_layers = best_params["n_layers"]
         cfg.d_ff = best_params["d_ff_derived"]
         cfg.dropout = best_params["dropout"]
-        if "top_k_attention" in best_params:
-            cfg.top_k_attention = best_params["top_k_attention"]
         cfg.n_mlp_layers = best_params["n_mlp_layers"]
+        cfg.path2_n_layers = best_params["path2_n_layers"]
+        cfg.path2_n_heads = best_params["path2_n_heads"]
+        cfg.path2_d_ff = best_params["path2_d_ff"]
         cfg.lambda_aux = best_params["lambda_aux"]
+        cfg.lambda_aux2 = best_params["lambda_aux2"]
         cfg.learning_rate = best_params["lr"]
         cfg.weight_decay = best_params["weight_decay"]
         cfg.grad_clip = best_params["grad_clip"]

@@ -284,14 +284,17 @@ class FirmScoreHead(nn.Module):
         return self.net(z).squeeze(-1)
 
 
-def _cross_sectional_soft_norm(z_c, temperature=2.0):
-    n = z_c.shape[0]
-    if n <= 1:
-        return torch.zeros_like(z_c)
-    mean = z_c.mean(dim=0, keepdim=True)
-    std = z_c.std(dim=0, keepdim=True, unbiased=False)
-    z_score = (z_c - mean) / (std + 1e-6)
-    return 0.5 * torch.tanh(z_score / temperature)
+class Path2Transformer(nn.Module):
+    def __init__(self, d_in, n_heads, n_layers, d_ff):
+        super().__init__()
+        self.blocks = nn.ModuleList([TransformerBlock(d_in, n_heads, d_ff) for _ in range(n_layers)])
+        self.lam = nn.Parameter(torch.randn(d_in) * (1.0 / d_in))
+
+    def forward(self, x):
+        y = x
+        for block in self.blocks:
+            y, _ = block(y)
+        return y @ self.lam
 
 
 class DualPathTransformer(nn.Module):
@@ -307,8 +310,7 @@ class DualPathTransformer(nn.Module):
         self.k0_agg = AttentiveAggregation(config.d_model)
         self.k1_agg = AttentiveAggregation(config.d_model)
         self.base_head_6m = FirmScoreHead(config.d_model, config.d_ff, config.n_mlp_layers, config.dropout)
-        self.blocks = nn.ModuleList([TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout) for _ in range(config.n_layers)])
-        self.adj_head_6m = nn.Sequential(nn.LayerNorm(config.d_model), nn.Linear(config.d_model, 1))
+        self.path2_net = Path2Transformer(n_k0 + n_k1, config.path2_n_heads, config.path2_n_layers, config.path2_d_ff)
         self.min_firms = config.min_firms_attention
 
     def _encode_firms(self, k0, k1, k0_miss, k1_miss):
@@ -321,17 +323,14 @@ class DualPathTransformer(nn.Module):
     def forward(self, k0, k1, k0_miss, k1_miss, country_ids):
         z = self._encode_firms(k0, k1, k0_miss, k1_miss)
         base_6m = self.base_head_6m(z)
-        adj_6m = torch.zeros_like(base_6m)
+        x2 = torch.cat([k0, k1], dim=-1)
+        path2_6m = torch.zeros_like(base_6m)
         for cid in country_ids.unique():
             mask = country_ids == cid
             if mask.sum() < self.min_firms:
                 continue
-            z_c = z[mask]
-            z_c = _cross_sectional_soft_norm(z_c)
-            for block in self.blocks:
-                z_c, _ = block(z_c)
-            adj_6m[mask] = self.adj_head_6m(z_c).squeeze(-1)
-        return {"scores_6m": base_6m + adj_6m, "base_6m": base_6m, "adj_6m": adj_6m}
+            path2_6m[mask] = self.path2_net(x2[mask])
+        return {"scores_6m": base_6m + path2_6m, "base_6m": base_6m, "path2_6m": path2_6m}
 
 
 def _differentiable_long_short_return(scores, returns, valid_mask):
@@ -362,9 +361,11 @@ def compute_msrr_loss(output, targets, valid_masks, config):
         return torch.tensor(0.0, device=device_, requires_grad=True)
     r_pf = _differentiable_long_short_return(output["scores_6m"], target, valid)
     r_base = _differentiable_long_short_return(output["base_6m"], target, valid)
+    r_path2 = _differentiable_long_short_return(output["path2_6m"], target, valid)
     main_loss = (1.0 - r_pf).pow(2)
     aux_loss = (1.0 - r_base).pow(2)
-    return main_loss + config.lambda_aux * aux_loss
+    aux2_loss = (1.0 - r_path2).pow(2)
+    return main_loss + config.lambda_aux * aux_loss + config.lambda_aux2 * aux2_loss
 
 
 def compute_rank_correlation(scores, targets, valid_mask):
@@ -426,7 +427,7 @@ def evaluate(model, dataset, config):
     total_loss = 0.0
     total_corr_6m = 0.0
     total_corr_base_6m = 0.0
-    total_corr_adj_6m = 0.0
+    total_corr_path2_6m = 0.0
     n = 0
     for idx in range(len(dataset)):
         batch = dataset[idx]
@@ -441,21 +442,23 @@ def evaluate(model, dataset, config):
         total_loss += compute_msrr_loss(output, targets, valid_masks, config).item()
         total_corr_6m += compute_rank_correlation(output["scores_6m"], targets["target_6m"], valid_masks["target_6m"])
         total_corr_base_6m += compute_rank_correlation(output["base_6m"], targets["target_6m"], valid_masks["target_6m"])
-        total_corr_adj_6m += compute_rank_correlation(output["adj_6m"], targets["target_6m"], valid_masks["target_6m"])
+        total_corr_path2_6m += compute_rank_correlation(output["path2_6m"], targets["target_6m"], valid_masks["target_6m"])
         n += 1
     m = max(n, 1)
-    return {"loss": total_loss / m, "rank_corr_6m": total_corr_6m / m, "rank_corr_base_6m": total_corr_base_6m / m, "rank_corr_adj_6m": total_corr_adj_6m / m}
+    return {"loss": total_loss / m, "rank_corr_6m": total_corr_6m / m, "rank_corr_base_6m": total_corr_base_6m / m, "rank_corr_path2_6m": total_corr_path2_6m / m}
 
 
 def sample_hyperparameters(trial, variant):
 
     d_model = trial.suggest_categorical("d_model", [64, 96, 128])
-    n_heads = trial.suggest_categorical("n_heads", [2, 4, 8])
     d_ff_mult = trial.suggest_categorical("d_ff_mult", [2, 4])
-    n_layers = trial.suggest_int("n_layers", 1, 3)
     dropout = trial.suggest_float("dropout", 0.01, 0.4)
     n_mlp_layers = trial.suggest_int("n_mlp_layers", 1, 3)
+    path2_n_layers = trial.suggest_int("path2_n_layers", 1, 3)
+    path2_n_heads = trial.suggest_categorical("path2_n_heads", [1, 2, 4])
+    path2_d_ff = trial.suggest_categorical("path2_d_ff", [128, 256, 512])
     lambda_aux = trial.suggest_float("lambda_aux", 0.1, 0.5)
+    lambda_aux2 = trial.suggest_float("lambda_aux2", 0.1, 0.5)
     lr = trial.suggest_float("lr", 5e-5, 5e-3, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-2, log=True)
     grad_clip = trial.suggest_float("grad_clip", 0.1, 5.0)
@@ -465,12 +468,14 @@ def sample_hyperparameters(trial, variant):
 
     return {
         "d_model": d_model,
-        "n_heads": n_heads,
         "d_ff": d_model * d_ff_mult,
-        "n_layers": n_layers,
         "dropout": dropout,
         "n_mlp_layers": n_mlp_layers,
+        "path2_n_layers": path2_n_layers,
+        "path2_n_heads": path2_n_heads,
+        "path2_d_ff": path2_d_ff,
         "lambda_aux": lambda_aux,
+        "lambda_aux2": lambda_aux2,
         "learning_rate": lr,
         "weight_decay": weight_decay,
         "grad_clip": grad_clip,
@@ -483,13 +488,14 @@ def sample_hyperparameters(trial, variant):
 class TrialConfig:
     encoding_variant: str = "linear"
     d_model: int = 64
-    n_heads: int = 4
-    n_layers: int = 2
     d_ff: int = 128
     dropout: float = 0.1
-    top_k_attention: int = 50
     n_mlp_layers: int = 2
+    path2_n_layers: int = 2
+    path2_n_heads: int = 1
+    path2_d_ff: int = 256
     lambda_aux: float = 0.3
+    lambda_aux2: float = 0.3
     min_firms_attention: int = 10
     warmup_epochs: int = 5
     learning_rate: float = 1e-4
@@ -635,7 +641,7 @@ def objective(trial, variant, train_ds, val_ds, tuning_config):
         val_loss = val_metrics["loss"]
         val_corr_6m = val_metrics["rank_corr_6m"]
         val_base_corr_6m = val_metrics["rank_corr_base_6m"]
-        val_adj_corr_6m = val_metrics["rank_corr_adj_6m"]
+        val_path2_corr_6m = val_metrics["rank_corr_path2_6m"]
 
         if epoch > cfg.warmup_epochs:
             scheduler.step(val_loss)
@@ -648,7 +654,7 @@ def objective(trial, variant, train_ds, val_ds, tuning_config):
             "val_loss": val_loss,
             "corr_6m": val_corr_6m,
             "base_corr_6m": val_base_corr_6m,
-            "adj_corr_6m": val_adj_corr_6m,
+            "path2_corr_6m": val_path2_corr_6m,
         }
         pd.DataFrame([epoch_row]).to_csv(epoch_log_path, mode="a", header=not epoch_log_path.exists(), index=False)
 
@@ -705,13 +711,13 @@ def _print_trial_row(trial, study, w):
     marker = "  *" if (not pruned and trial.number == study.best_trial.number) else ""
     p = trial.params
     d_model = p.get("d_model", "?")
-    n_heads = p.get("n_heads", "?")
+    n_heads = p.get("path2_n_heads", "?")
     lr = p.get("lr", float("nan"))
-    n_layers = p.get("n_layers", "?")
+    n_layers = p.get("path2_n_layers", "?")
     ua = trial.user_attrs
     base_corr_6m = ua.get("best_base_corr_6m", ua.get("last_base_corr_6m", float("nan")))
-    adj_corr_6m = ua.get("best_adj_corr_6m", ua.get("last_adj_corr_6m", float("nan")))
-    print(f"{trial.number + 1:>5}{value:>8.4f}{base_corr_6m:>8.4f}{adj_corr_6m:>8.4f}{best:>8.4f}  " f"d={d_model:<3} h={n_heads:<2} L={n_layers}  lr={lr:.2e}  " f"{status:<6}{marker}")
+    path2_corr_6m = ua.get("best_path2_corr_6m", ua.get("last_path2_corr_6m", float("nan")))
+    print(f"{trial.number + 1:>5}{value:>8.4f}{base_corr_6m:>8.4f}{path2_corr_6m:>8.4f}{best:>8.4f}  " f"d={d_model:<3} p2h={n_heads:<2} p2L={n_layers}  lr={lr:.2e}  " f"{status:<6}{marker}")
     sys.stdout.flush()
 
 
@@ -745,7 +751,7 @@ def _print_best_params(study, variant, results_dir):
     print(f"{'val MSRR (best ep)':<25} {ua.get('best_val_loss', float('nan')):.6f}")
     print(f"{'corr 6m, combined':<25} {ua.get('best_corr_6m', float('nan')):.6f}")
     print(f"{'corr 6m, base f_firm':<25} {ua.get('best_base_corr_6m', float('nan')):.6f}")
-    print(f"{'corr 6m, adjustment':<25} {ua.get('best_adj_corr_6m', float('nan')):.6f}")
+    print(f"{'corr 6m, path 2':<25} {ua.get('best_path2_corr_6m', float('nan')):.6f}")
     print(f"{'val Sharpe LS':<25} {ua.get('val_sharpe_ls', float('nan')):.6f}")
 
     n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
@@ -763,7 +769,7 @@ def _print_best_params(study, variant, results_dir):
     payload["d_ff_derived"] = best.params["d_model"] * best.params["d_ff_mult"]
     payload["best_val_sharpe_ls"] = best.value
     payload["trial_number"] = best.number + 1
-    for key in ["best_epoch", "n_epochs_trained", "best_train_loss", "best_val_loss", "best_corr_6m", "best_base_corr_6m", "best_adj_corr_6m", "val_sharpe_ls"]:
+    for key in ["best_epoch", "n_epochs_trained", "best_train_loss", "best_val_loss", "best_corr_6m", "best_base_corr_6m", "best_path2_corr_6m", "val_sharpe_ls"]:
         if key in ua:
             payload[key] = ua[key]
     with open(out_path, "w") as f:
@@ -845,7 +851,7 @@ sep = "-" * w
 print(bar)
 print(" Cross-variant summary")
 print(sep)
-print(f"{'Variant':<14}{'Sharpe':>10}{'Best Sharpe':>13}{'AdjCorr':>10}{'Trial':>6}{'d_model':>7}{'n_heads':>7}{'lr':>10}{'n_layers':>8}")
+print(f"{'Variant':<14}{'Sharpe':>10}{'Best Sharpe':>13}{'Path2Corr':>10}{'Trial':>6}{'d_model':>7}{'p2_heads':>8}{'lr':>10}{'p2_layers':>9}")
 print(sep)
 for variant, study in all_studies.items():
     try:
@@ -853,11 +859,11 @@ for variant, study in all_studies.items():
         p = bt.params
         ua = bt.user_attrs
         base_corr_6m = ua.get("best_base_corr_6m", float("nan"))
-        adj_corr_6m = ua.get("best_adj_corr_6m", float("nan"))
+        path2_corr_6m = ua.get("best_path2_corr_6m", float("nan"))
         print(
-            f"  {variant:<14}  {bt.value:>10.6f}  {base_corr_6m:>13.6f}  {adj_corr_6m:>10.6f}  {bt.number + 1:>6}  "
-            f"{p.get('d_model', '?'):>7}  {p.get('n_heads', '?'):>7}  "
-            f"{p.get('lr', float('nan')):>10.2e}  {p.get('n_layers', '?'):>8}"
+            f"  {variant:<14}  {bt.value:>10.6f}  {base_corr_6m:>13.6f}  {path2_corr_6m:>10.6f}  {bt.number + 1:>6}  "
+            f"{p.get('d_model', '?'):>7}  {p.get('path2_n_heads', '?'):>8}  "
+            f"{p.get('lr', float('nan')):>10.2e}  {p.get('path2_n_layers', '?'):>9}"
         )
     except Exception:
         print(f"  {variant:<14}  {'no completed trials':>40}")
