@@ -1,12 +1,3 @@
-"""
-Feature Tokeniser Transformer benchmark on the Emerging Markets universe.
-
-Final training and test set evaluation against the cumulative six month
-forward excess return, with mean split selection, capped softmax
-weighting, and the same volatility overlay protocol used by the Dual Path
-Portfolio Transformer's six month head. Reads ft_best_params.json
-produced by ft_hpt.py.
-"""
 
 import json
 import math
@@ -21,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from safetensors.torch import save_file as safetensors_save
 from scipy.stats import spearmanr
 import matplotlib
@@ -30,8 +22,6 @@ warnings.filterwarnings('ignore')
 matplotlib.rcParams['font.size'] = 12
 
 
-# configuration
-
 train_path = Path('data/processed/train.parquet')
 val_path = Path('data/processed/val.parquet')
 test_path = Path('data/processed/test.parquet')
@@ -39,15 +29,12 @@ test_path = Path('data/processed/test.parquet')
 results_dir = Path('results/benchmark/ft_transformer_benchmark')
 results_dir.mkdir(parents = True, exist_ok = True)
 
-
 target_col = 'target_6m'
 
-# rebalance frequency and horizon are six months, matching the DPPT 6m head
 rebalance_freq = 6
 tc_bps = 25
 min_stocks = 30
 
-# volatility overlay parameters
 target_vol = 0.10
 vol_lookback_months = 36
 n_vol_periods = max(1, vol_lookback_months // rebalance_freq)
@@ -65,46 +52,50 @@ torch_seed = 48
 run_timestamp = datetime.utcnow().isoformat(timespec = 'seconds')
 
 
-# device
 cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if cuda_available else 'cpu')
 cuda_device_name = torch.cuda.get_device_name(0) if cuda_available else None
 use_amp = cuda_available
 
 
-# model classes
+class ReGLU(nn.Module):
+    def forward(self, x):
+        a, b = x.chunk(2, dim = -1)
+        return a * F.relu(b)
+
+
 class FeatureTokeniser(nn.Module):
     def __init__(self, n_features, d_model):
         super().__init__()
         self.weights = nn.Parameter(torch.empty(n_features, d_model))
         self.biases = nn.Parameter(torch.empty(n_features, d_model))
-        nn.init.kaiming_uniform_(self.weights, a = math.sqrt(5))
-        nn.init.uniform_(self.biases, -1.0, 1.0)
+        bound = 1.0 / math.sqrt(d_model)
+        nn.init.uniform_(self.weights, -bound, bound)
+        nn.init.uniform_(self.biases, -bound, bound)
 
     def forward(self, x):
         return x.unsqueeze(-1) * self.weights.unsqueeze(0) + self.biases.unsqueeze(0)
 
 
 class FTTransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout):
+    def __init__(self, d_model, n_heads, d_ff, dropout, first_block):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
+        self.norm1 = nn.Identity() if first_block else nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout = dropout, batch_first = True)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
+            nn.Linear(d_model, 2 * d_ff),
+            ReGLU(),
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
         )
-        self.drop = nn.Dropout(dropout)
+        self.residual_drop = nn.Dropout(dropout)
 
     def forward(self, x):
         normed = self.norm1(x)
         attn_out, _ = self.attn(normed, normed, normed, need_weights = False)
-        x = x + self.drop(attn_out)
-        x = x + self.ffn(self.norm2(x))
+        x = x + self.residual_drop(attn_out)
+        x = x + self.residual_drop(self.ffn(self.norm2(x)))
         return x
 
 
@@ -114,10 +105,13 @@ class FTTransformer(nn.Module):
         self.tokeniser = FeatureTokeniser(n_features, d_model)
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.blocks = nn.ModuleList([
-            FTTransformerBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)
+            FTTransformerBlock(d_model, n_heads, d_ff, dropout, first_block = (i == 0)) for i in range(n_layers)
         ])
-        self.final_norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, 1)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
 
     def forward(self, x):
         b = x.size(0)
@@ -126,7 +120,7 @@ class FTTransformer(nn.Module):
         tokens = torch.cat([cls, tokens], dim = 1)
         for block in self.blocks:
             tokens = block(tokens)
-        cls_out = self.final_norm(tokens[:, 0, :])
+        cls_out = tokens[:, 0, :]
         return self.head(cls_out).squeeze(-1)
 
 
@@ -151,8 +145,6 @@ class FTPredictor:
                 preds.append(out.float().cpu().numpy())
         return np.concatenate(preds, axis = 0)
 
-
-# portfolio construction
 
 def _capped_softmax_weights(scores, max_weight, max_iter = 20):
     scores = np.asarray(scores, dtype = np.float64)
@@ -182,8 +174,6 @@ def _capped_softmax_weights(scores, max_weight, max_iter = 20):
 
 
 def _renorm_over_valid(weights, valid):
-    """Redistribute the weight of firms with invalid forward returns onto
-    the remaining firms proportionally."""
     weights = np.asarray(weights, dtype = np.float64)
     valid = np.asarray(valid, dtype = bool)
     if not valid.any():
@@ -196,22 +186,33 @@ def _renorm_over_valid(weights, valid):
     return out
 
 
-def _firm_id_turnover(prev_ids, curr_ids):
-    """One sided turnover, (new and exited) over the size of the current
-    holding set."""
-    prev = set(prev_ids.tolist()) if prev_ids is not None else set()
-    curr = set(curr_ids.tolist())
-    if not curr:
+def _drift_weights(prev_ids, prev_w, realised_by_id):
+    if prev_ids is None or prev_w is None or len(prev_w) == 0:
+        return None, None
+    n = len(prev_w)
+    ids_list = []
+    growth = np.zeros(n, dtype = np.float64)
+    for j in range(n):
+        fid = int(prev_ids[j])
+        ids_list.append(fid)
+        growth[j] = float(prev_w[j]) * (1.0 + float(realised_by_id.get(fid, 0.0)))
+    g_sum = float(growth.sum())
+    drifted = growth / g_sum if g_sum > 1e-12 else growth
+    return ids_list, drifted
+
+
+def _weight_l1_turnover(prev_ids, prev_w, curr_ids, curr_w):
+    if curr_ids is None or curr_w is None or len(curr_w) == 0:
         return 0.0
-    new_in = len(curr - prev)
-    exited = len(prev - curr)
-    return (new_in + exited) / max(len(curr), 1)
+    curr_map = {int(curr_ids[j]): float(curr_w[j]) for j in range(len(curr_ids))}
+    if prev_ids is None or prev_w is None or len(prev_w) == 0:
+        return float(sum(abs(v) for v in curr_map.values()))
+    prev_map = {int(prev_ids[j]): float(prev_w[j]) for j in range(len(prev_ids))}
+    all_ids = set(prev_map) | set(curr_map)
+    return float(sum(abs(curr_map.get(fid, 0.0) - prev_map.get(fid, 0.0)) for fid in all_ids))
 
 
 def portfolio_metrics(rets, periods_per_year):
-    """Annualised portfolio metrics on a period return series. Sharpe uses
-    the arithmetic mean. The standard deviation uses
-    ddof equal to one."""
     rets = np.asarray(rets, dtype = np.float64)
     if len(rets) == 0:
         return {}
@@ -227,40 +228,50 @@ def portfolio_metrics(rets, periods_per_year):
     max_dd = float(((pk - cw) / pk).max())
 
     return {
-        'ann_ret': ann_ret, 'ann_vol': ann_vol,
-        'sharpe': sharpe, 'se_sharpe': se,
-        'max_dd': max_dd, 'cagr': cagr,
-        'cumulative_return': cum_return, 'n_obs': n,
+        'ann_ret': ann_ret,
+        'ann_vol': ann_vol,
+        'sharpe': sharpe,
+        'se_sharpe': se,
+        'max_dd': max_dd,
+        'cagr': cagr,
+        'cumulative_return': cum_return,
+        'n_obs': n,
     }
 
 
-def apply_period_vol_overlay(period_rets, target_vol, n_vol_periods, periods_per_year, max_leverage):
-    """Volatility overlay computed on period returns."""
-    period_rets = np.asarray(period_rets, dtype = np.float64)
-    n = len(period_rets)
-    leverage_path = np.ones(n, dtype = np.float64)
-    for t in range(n):
-        if t < n_vol_periods:
-            continue
-        trailing = period_rets[t - n_vol_periods:t]
-        if len(trailing) < 2:
-            continue
-        realised_vol = float(trailing.std(ddof=1) * np.sqrt(periods_per_year))
-        lev = target_vol / max(realised_vol, 1e-8)
-        leverage_path[t] = float(np.clip(lev, 1.0 / max_leverage, max_leverage))
-    return leverage_path
+def _overlay_leverage(raw_hist, periods_per_year, max_leverage):
+    if len(raw_hist) >= n_vol_periods:
+        recent = np.array(raw_hist[-n_vol_periods:])
+        realised_vol = recent.std(ddof = 1) * np.sqrt(periods_per_year)
+        lev = target_vol / max(realised_vol, 1e-6)
+        return float(np.clip(lev, 1.0 / max_leverage, max_leverage))
+    return 1.0
 
 
-def apply_overlay_and_costs(leg_unscaled_rets, leg_tc, n_vol_periods, periods_per_year, max_leverage):
-    """Combine leg returns, transaction costs, and the period volatility
-    overlay. Returns scaled net returns, unscaled net returns, and the
-    leverage path per period."""
-    leg_unscaled_rets = np.asarray(leg_unscaled_rets, dtype = np.float64)
-    leg_tc = np.asarray(leg_tc, dtype = np.float64)
-    leverage_path = apply_period_vol_overlay(leg_unscaled_rets, target_vol, n_vol_periods, periods_per_year, max_leverage)
-    unscaled_net = leg_unscaled_rets - leg_tc
-    scaled_net = leverage_path * leg_unscaled_rets - leverage_path * leg_tc
-    return scaled_net, unscaled_net, leverage_path
+def seed_vol_history(predictor, month_dates, all_months, leg_kind):
+    returns = []
+    for pos, eom in enumerate(month_dates):
+        if pos % rebalance_freq != 0:
+            continue
+        if eom not in all_months:
+            continue
+        m = all_months[eom]
+        pred = predictor.predict(m['x'])
+        r = m['r']
+        valid = np.isfinite(pred) & np.isfinite(r)
+        n_firms = len(pred)
+        if leg_kind == 'long_only':
+            w = _capped_softmax_weights(pred, 1.0)
+            w = _renorm_over_valid(w, valid)
+            returns.append(float(np.sum(w[valid] * r[valid])))
+        else:
+            mean_s = float(pred.mean())
+            long_r = [r[i] for i in range(n_firms) if pred[i] > mean_s and valid[i]]
+            short_r = [r[i] for i in range(n_firms) if pred[i] <= mean_s and valid[i]]
+            long_ret = sum(long_r) / max(len(long_r), 1) if long_r else 0.0
+            short_ret = sum(short_r) / max(len(short_r), 1) if short_r else 0.0
+            returns.append(long_ret - short_ret)
+    return returns[-n_vol_periods:] if returns else []
 
 
 def predict_test(predictor, month_dates, all_months):
@@ -272,7 +283,8 @@ def predict_test(predictor, month_dates, all_months):
         pred = predictor.predict(m['x'])
         for k in range(len(m['ids'])):
             rows.append({
-                'eom': eom, 'id': m['ids'][k], 'prediction': float(pred[k]), 'realised_return': float(m['r'][k]),
+                'eom': eom, 'id': m['ids'][k],
+                'prediction': float(pred[k]), 'realised_return': float(m['r'][k]),
             })
     return pd.DataFrame(rows)
 
@@ -288,24 +300,24 @@ def rank_correlation_oos(predictor, month_dates, all_months):
         if valid.sum() < 10:
             continue
         result = spearmanr(pred[valid], m['r'][valid])
-        c = float(result[0])                             #type: ignore
+        c = float(result[0])
         if not np.isnan(c):
             corrs.append(c)
     return float(np.mean(corrs)) if corrs else 0.0
 
 
-def run_mean_split_simulation(predictor, month_dates, all_months):
-    """Mean split selection with capped softmax weighting. The simulation produces a per period
-    return series, namely one observation per rebalance_freq months."""
-    ls_period_rets, ls_period_dates, ls_tc_history = [], [], []
-    lo_period_rets, lo_period_dates, lo_tc_history = [], [], []
+def run_mean_split_simulation(predictor, month_dates, all_months, ls_seed = None, lo_seed = None, record_holdings = False):
+    ls_scaled, ls_unscaled, ls_dates, ls_lev = [], [], [], []
+    lo_scaled, lo_unscaled, lo_dates, lo_lev = [], [], [], []
+    raw_ls_hist = list(ls_seed) if ls_seed else []
+    raw_lo_hist = list(lo_seed) if lo_seed else []
 
-    prev_long_ids = None
-    prev_short_ids = None
-    prev_lo_ids = None
+    prev_long_ids = prev_long_w = prev_long_realised = None
+    prev_short_ids = prev_short_w = prev_short_realised = None
+    prev_lo_ids = prev_lo_w = prev_lo_realised = None
 
     ls_holdings, lo_holdings = [], []
-    rb_counter = -1
+    rb = -1
 
     for pos, eom in enumerate(month_dates):
         if pos % rebalance_freq != 0:
@@ -314,7 +326,6 @@ def run_mean_split_simulation(predictor, month_dates, all_months):
             continue
         m = all_months[eom]
         ids, r, x = m['ids'], m['r'], m['x']
-
         n_firms = len(ids)
         if n_firms < min_stocks:
             continue
@@ -323,133 +334,112 @@ def run_mean_split_simulation(predictor, month_dates, all_months):
         valid_pred = np.isfinite(pred)
         if valid_pred.sum() < min_stocks:
             continue
+        valid = valid_pred & np.isfinite(r)
+        rb += 1
 
-        valid_ret = np.isfinite(r)
-        valid = valid_pred & valid_ret
-        rb_counter += 1
-
-        # long short by mean split
         mean_score = float(pred[valid_pred].mean())
-        long_mask = (pred > mean_score) & valid_pred
-        short_mask = (pred <= mean_score) & valid_pred
-        long_idx = np.where(long_mask)[0]
-        short_idx = np.where(short_mask)[0]
-        long_firm_ids = ids[long_idx]
-        short_firm_ids = ids[short_idx]
+        long_idx = np.where((pred > mean_score) & valid_pred)[0]
+        short_idx = np.where((pred <= mean_score) & valid_pred)[0]
+        long_ids = [int(v) for v in ids[long_idx]]
+        short_ids = [int(v) for v in ids[short_idx]]
 
-        long_w = _capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight)
-        short_w = _capped_softmax_weights(mean_score - pred[short_idx], max_position_weight)
-        long_w = _renorm_over_valid(long_w, valid[long_idx])
-        short_w = _renorm_over_valid(short_w, valid[short_idx])
+        long_w = _renorm_over_valid(_capped_softmax_weights(pred[long_idx] - mean_score, max_position_weight), valid[long_idx])
+        short_w = _renorm_over_valid(_capped_softmax_weights(mean_score - pred[short_idx], max_position_weight), valid[short_idx])
 
-        long_ret = float(np.sum(long_w[valid[long_idx]] * r[long_idx][valid[long_idx]])) if long_idx.size else 0.0
-        short_ret = float(np.sum(short_w[valid[short_idx]] * r[short_idx][valid[short_idx]])) if short_idx.size else 0.0
+        long_realised, long_ret = {}, 0.0
+        for i, fi in enumerate(long_idx):
+            rr = float(r[fi]) if valid[fi] else 0.0
+            long_realised[int(ids[fi])] = rr
+            long_ret += long_w[i] * rr
+        short_realised, short_ret = {}, 0.0
+        for i, fi in enumerate(short_idx):
+            rr = float(r[fi]) if valid[fi] else 0.0
+            short_realised[int(ids[fi])] = rr
+            short_ret += short_w[i] * rr
         ls_ret = long_ret - short_ret
 
-        lt = _firm_id_turnover(prev_long_ids, long_firm_ids)
-        st = _firm_id_turnover(prev_short_ids, short_firm_ids)
+        d_long_ids, d_long_w = _drift_weights(prev_long_ids, prev_long_w, prev_long_realised)
+        d_short_ids, d_short_w = _drift_weights(prev_short_ids, prev_short_w, prev_short_realised)
+        lt = _weight_l1_turnover(d_long_ids, d_long_w, long_ids, long_w)
+        st = _weight_l1_turnover(d_short_ids, d_short_w, short_ids, short_w)
         ls_flat_tc = (lt + st) * tc_bps / 10000.0
 
-        ls_period_rets.append(ls_ret)
-        ls_period_dates.append(eom)
-        ls_tc_history.append(ls_flat_tc)
-        prev_long_ids = long_firm_ids
-        prev_short_ids = short_firm_ids
+        ls_leverage = _overlay_leverage(raw_ls_hist, periods_per_year, max_leverage_long_short)
+        ls_scaled.append(ls_leverage * ls_ret - ls_leverage * ls_flat_tc)
+        ls_unscaled.append(ls_ret - ls_flat_tc)
+        ls_lev.append(ls_leverage)
+        ls_dates.append(eom)
+        raw_ls_hist.append(ls_ret)
 
-        # long only over all firms
+        prev_long_ids, prev_long_w, prev_long_realised = long_ids, long_w, long_realised
+        prev_short_ids, prev_short_w, prev_short_realised = short_ids, short_w, short_realised
+
         lo_w = _capped_softmax_weights(pred[valid_pred], max_position_weight)
         lo_w_full = np.zeros(n_firms, dtype = np.float64)
         lo_w_full[valid_pred] = lo_w
         lo_w_full = _renorm_over_valid(lo_w_full, valid)
-        lo_ret = float(np.sum(lo_w_full[valid] * r[valid]))
-        lo_firm_ids = ids[valid_pred]
-        lo_turn = _firm_id_turnover(prev_lo_ids, lo_firm_ids)
+        lo_ids = [int(v) for v in ids]
+        lo_realised, lo_ret = {}, 0.0
+        for fi in range(n_firms):
+            rr = float(r[fi]) if valid[fi] else 0.0
+            lo_realised[int(ids[fi])] = rr
+            lo_ret += lo_w_full[fi] * rr
+
+        d_lo_ids, d_lo_w = _drift_weights(prev_lo_ids, prev_lo_w, prev_lo_realised)
+        lo_turn = _weight_l1_turnover(d_lo_ids, d_lo_w, lo_ids, lo_w_full)
         lo_flat_tc = lo_turn * tc_bps / 10000.0
 
-        lo_period_rets.append(lo_ret)
-        lo_period_dates.append(eom)
-        lo_tc_history.append(lo_flat_tc)
-        prev_lo_ids = lo_firm_ids
+        lo_leverage = _overlay_leverage(raw_lo_hist, periods_per_year, max_leverage_long_only)
+        lo_scaled.append(lo_leverage * lo_ret - lo_leverage * lo_flat_tc)
+        lo_unscaled.append(lo_ret - lo_flat_tc)
+        lo_lev.append(lo_leverage)
+        lo_dates.append(eom)
+        raw_lo_hist.append(lo_ret)
 
-        for i, fi in enumerate(long_idx):
-            ls_holdings.append({
-                'rebalance_index': rb_counter, 'eom': eom, 'leg': 'long',
-                'id': int(ids[fi]), 'weight': float(long_w[i]),
-                'realised_return': float(r[fi]) if valid[fi] else float('nan'),
-            })
-        for i, fi in enumerate(short_idx):
-            ls_holdings.append({
-                'rebalance_index': rb_counter, 'eom': eom, 'leg': 'short',
-                'id': int(ids[fi]), 'weight': float(-short_w[i]),
-                'realised_return': float(r[fi]) if valid[fi] else float('nan'),
-            })
-        valid_pred_idx = np.where(valid_pred)[0]
-        for i, fi in enumerate(valid_pred_idx):
-            lo_holdings.append({
-                'rebalance_index': rb_counter, 'eom': eom, 'leg': 'long',
-                'id': int(ids[fi]), 'weight': float(lo_w_full[fi]),
-                'realised_return': float(r[fi]) if valid[fi] else float('nan'),
-            })
+        prev_lo_ids, prev_lo_w, prev_lo_realised = lo_ids, lo_w_full, lo_realised
+
+        if record_holdings:
+            for i, fi in enumerate(long_idx):
+                ls_holdings.append({'rebalance_index': rb, 'eom': eom, 'leg': 'long', 'id': int(ids[fi]), 'weight': float(long_w[i]), 'realised_return': float(r[fi]) if valid[fi] else float('nan')})
+            for i, fi in enumerate(short_idx):
+                ls_holdings.append({'rebalance_index': rb, 'eom': eom, 'leg': 'short', 'id': int(ids[fi]), 'weight': float(-short_w[i]), 'realised_return': float(r[fi]) if valid[fi] else float('nan')})
+            for fi in range(n_firms):
+                if valid_pred[fi]:
+                    lo_holdings.append({'rebalance_index': rb, 'eom': eom, 'leg': 'long', 'id': int(ids[fi]), 'weight': float(lo_w_full[fi]), 'realised_return': float(r[fi]) if valid[fi] else float('nan')})
 
     return {
         'long_short': {
-            'returns': np.array(ls_period_rets),
-            'tc': np.array(ls_tc_history),
-            'dates': ls_period_dates,
+            'scaled': np.array(ls_scaled),
+            'unscaled': np.array(ls_unscaled),
+            'leverage': np.array(ls_lev),
+            'dates': ls_dates,
             'holdings_df': pd.DataFrame(ls_holdings),
         },
         'long_only': {
-            'returns': np.array(lo_period_rets),
-            'tc': np.array(lo_tc_history),
-            'dates': lo_period_dates,
+            'scaled': np.array(lo_scaled),
+            'unscaled': np.array(lo_unscaled),
+            'leverage': np.array(lo_lev),
+            'dates': lo_dates,
             'holdings_df': pd.DataFrame(lo_holdings),
         },
     }
 
 
-# data loading
 def load_data():
     train_schema = pq.read_schema(train_path)
     non_feature = {
-        # identifiers
         'id', 'gvkey', 'iid', 'isin', 'cusip', 'permno', 'permco',
-        # dates, country, currency, size grouping
         'eom', 'date', 'excntry', 'curcd', 'size_grp',
-        # raw monthly return columns. excluded because ret_exc_lead1m was
-        # used for target construction in the previous approach and
-        # ret_exc_lead6m was the old target name. both are superseded by
-        # target_6m and must not appear as features
         'ret_exc_lead1m', 'ret_exc_lead6m',
-        # DPPT-preprocessed forward return targets. target_6m is the
-        # prediction target and is excluded via target_col. the others are
-        # excluded as direct correlates of the training target that would
-        # cause look-ahead leakage if left in the feature set
         'target_1m', 'target_3m', 'target_6m', 'target_12m',
-        # industry classification codes, encoded as float but categorical
         'sic', 'naics', 'gics', 'ff49',
-        # exchange and share classification codes, also categorical
         'comp_tpci', 'crsp_shrcd', 'comp_exchg', 'crsp_exchcd',
-        # filter and quality indicators, used for sample selection only
         'obs_main', 'exch_main', 'primary_sec', 'common', 'bidask',
         'source_crsp',
-        # return calculation metadata
         'adjfct', 'fx', 'ret_lag_dif',
-        # raw same period returns, redundant with the ret_1_0 short term
-        # reversal characteristic and not cross sectionally rank normalised
         'ret', 'ret_exc', 'ret_local',
-        # level forms of characteristics, redundant with the ranked
-        # characteristics that already derive from them
         'me', 'me_company', 'prc', 'prc_local', 'prc_high', 'prc_low',
         'dolvol', 'shares', 'tvol',
-        # raw accounting aggregates in dollar terms. these are excluded
-        # from characteristic processing in the DPPT preprocessing
-        # pipeline and therefore never pass through cross_sectional_normalise,
-        # so they remain in the processed parquet as unranked, unbounded
-        # dollar magnitudes rather than characteristics on a common scale.
-        # including them here would feed the feature tokeniser a handful
-        # of inputs with a completely different distribution from every
-        # other feature, and would make the feature set inconsistent with
-        # the K0 and K1 characteristic set DPPT itself trains on
         'enterprise_value', 'book_equity', 'assets', 'sales',
         'net_income', 'intrinsic_value',
     }
@@ -480,7 +470,6 @@ def load_data():
     print(f'val rows, {len(val_df):,}')
     print(f'test rows, {len(test_df):,}')
 
-    # sanity check the precomputed target
     for label, split in [('train', train_df), ('val', val_df), ('test', test_df)]:
         non_null = split[target_col].notna().sum()
         print(
@@ -495,12 +484,8 @@ def load_data():
     n_feat = len(feature_cols)
     all_months = {}
 
-    # build per-month cross sections from each split in order. characteristics
-    # are already rank-normalised by the DPPT pipeline so we read the values
-    # directly. a nan_to_num guard handles any residual missing cells.
     for split_df in (train_df, val_df, test_df):
         for eom, group in split_df.groupby('eom', sort = True):
-            group = group[group[target_col].notna()]
             if len(group) < min_stocks:
                 continue
             ids = group['id'].to_numpy()
@@ -514,8 +499,11 @@ def load_data():
     val_dates = [d for d in sorted_dates if train_end < d <= val_end]
     test_dates = [d for d in sorted_dates if d > val_end]
 
-    x_train = np.vstack([all_months[d]['x'] for d in train_dates])
-    y_train = np.concatenate([all_months[d]['r'] for d in train_dates]).astype(np.float32)
+    x_train_full = np.vstack([all_months[d]['x'] for d in train_dates])
+    y_train_full = np.concatenate([all_months[d]['r'] for d in train_dates]).astype(np.float32)
+    train_mask = np.isfinite(y_train_full)
+    x_train = x_train_full[train_mask]
+    y_train = y_train_full[train_mask]
     print(f'x_train shape, {x_train.shape}')
 
     return {
@@ -531,7 +519,6 @@ def load_data():
 
 
 def save_training_data(data):
-    """Save the rank normalised training observations and metadata."""
     feature_cols = data['feature_cols']
     train_dates = data['train_dates']
     val_dates = data['val_dates']
@@ -566,7 +553,6 @@ def save_training_data(data):
 
 
 def save_test_inputs(data):
-    """Save rank normalised inputs for every firm month in the test set."""
     feature_cols = data['feature_cols']
     test_dates = data['test_dates']
     all_months = data['all_months']
@@ -603,13 +589,8 @@ def save_test_inputs(data):
         }, fh, indent = 2)
 
 
-# training function
-
 def train_ft_transformer(params, x_train_pool, y_train_pool, val_dates_local,
                          all_months, n_epochs, patience, device, seed, n_features):
-    """Train a Feature Tokeniser Transformer with the given hyperparameters
-    and early stopping on the validation rank correlation. Returns the
-    trained model and a dictionary of training diagnostics."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     if device.type == 'cuda':
@@ -712,8 +693,6 @@ def train_ft_transformer(params, x_train_pool, y_train_pool, val_dates_local,
     }
 
 
-# plotting helpers
-
 def configure_plot_style():
     plt.rcParams.update({
         'mathtext.fontset': 'cm',
@@ -730,40 +709,46 @@ def plot_cumulative_wealth(ls_returns_raw, ls_returns_scaled, lo_returns_raw, lo
     xlabel_periods = f'Rebalance periods from start of test window ({rebalance_freq} months each)'
     fig, axes = plt.subplots(1, 2, figsize = (12, 4.5))
 
-    axes[0].plot(np.cumprod(1.0 + ls_returns_scaled), label = 'long short vol', color = 'C0')
-    axes[0].plot(np.cumprod(1.0 + ls_returns_raw), label = 'long short Unscaled', color = 'C0', linestyle = '--', alpha = 0.5)
+    axes[0].plot(np.cumprod(1.0 + ls_returns_scaled), label = 'long short vol', color = '#1F4E79')
+    axes[0].plot(np.cumprod(1.0 + ls_returns_raw), label = 'long short raw', color = '#1F4E79', linestyle = '--', alpha = 0.5)
     axes[0].set_xlabel(xlabel_periods)
     axes[0].set_ylabel('Cumulative Wealth')
     axes[0].legend(frameon = False, loc = 'upper left')
 
-    axes[1].plot(np.cumprod(1.0 + lo_returns_scaled), label = 'long only vol', color = 'C3')
-    axes[1].plot(np.cumprod(1.0 + lo_returns_raw), label = 'long only Unscaled', color = 'C3', linestyle = '--', alpha = 0.5)
+    axes[1].plot(np.cumprod(1.0 + lo_returns_scaled), label = 'long only vol', color = '#8B2D2D')
+    axes[1].plot(np.cumprod(1.0 + lo_returns_raw), label = 'long only raw', color = '#8B2D2D', linestyle = '--', alpha = 0.5)
     axes[1].set_xlabel(xlabel_periods)
     axes[1].set_ylabel('Cumulative Wealth')
     axes[1].legend(frameon = False, loc = 'upper left')
 
     fig.tight_layout()
-    fig.show()
+    fig.savefig(results_dir / 'ft_cumulative_wealth.pdf')
+    fig.savefig(results_dir / 'ft_cumulative_wealth.png')
+    plt.close(fig)
+    print('cumulative wealth plot saved')
 
 
 def plot_training_diagnostics(train_losses, val_rank_corr, best_epoch):
     configure_plot_style()
     fig, axes = plt.subplots(1, 2, figsize = (12, 4.5))
 
-    axes[0].plot(train_losses, color = 'C0')
-    axes[0].axvline(best_epoch, color = 'C3', linestyle = '--', alpha = 0.7, label = f'best epoch, {best_epoch}')
+    axes[0].plot(train_losses, color = '#1F4E79')
+    axes[0].axvline(best_epoch, color = '#8B2D2D', linestyle = '--', alpha = 0.7, label = f'best epoch, {best_epoch}')
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('Training MSE')
     axes[0].legend(frameon = False, loc = 'upper right')
 
-    axes[1].plot(val_rank_corr, color = 'C2')
-    axes[1].axvline(best_epoch, color = 'C0', linestyle = '--', alpha = 0.7, label = f'best epoch, {best_epoch}')
+    axes[1].plot(val_rank_corr, color = '#1E5F38')
+    axes[1].axvline(best_epoch, color = '#8B2D2D', linestyle = '--', alpha = 0.7, label = f'best epoch, {best_epoch}')
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Validation Rank Correlation')
     axes[1].legend(frameon = False, loc = 'lower right')
 
     fig.tight_layout()
-    fig.show()
+    fig.savefig(results_dir / 'ft_training_diagnostics.pdf')
+    fig.savefig(results_dir / 'ft_training_diagnostics.png')
+    plt.close(fig)
+    print('training diagnostics plot saved')
 
 
 def main():
@@ -774,11 +759,10 @@ def main():
         print(f'device name, {cuda_device_name}')
         print('mixed precision, enabled')
     print(f'run timestamp utc, {run_timestamp}')
-    print(f'construction, mean_split_softmax_cap_6m')
+    print('construction, mean_split_softmax_cap_6m')
     print(f'periods_per_year, {periods_per_year}')
     print(f'n_vol_periods, {n_vol_periods}')
 
-    # load data and save the training data info
     data = load_data()
     save_training_data(data)
     save_test_inputs(data)
@@ -790,10 +774,8 @@ def main():
     train_dates = data['train_dates']
     val_dates = data['val_dates']
     test_dates = data['test_dates']
-    sorted_dates = data['sorted_dates']
     n_feat = data['n_feat']
 
-    # load the best hyperparameters produced by ft_hpt.py
     best_params_path = results_dir / 'ft_best_params.json'
     if not best_params_path.exists():
         raise FileNotFoundError(
@@ -812,7 +794,6 @@ def main():
     ft_best = best_data['best_params']
     print(f'best params loaded, {ft_best}')
 
-    # final training with the best hyperparameters
     t0 = time.time()
     ft_model, ft_log = train_ft_transformer(
         params = ft_best,
@@ -832,11 +813,9 @@ def main():
     print(f'final model trained in {ft_train_time:.1f} s')
     print(f'parameter count, {n_params:,}')
 
-    # model weights saved as safetensors
     safetensors_save(ft_model.state_dict(), str(results_dir / 'ft_weights.safetensors'))
     print('weights saved, ft_weights.safetensors')
 
-    # training log written as json
     ft_train_log = {
         'construction': 'mean_split_softmax_cap_6m',
         'target_column': target_col,
@@ -853,55 +832,40 @@ def main():
     with open(results_dir / 'ft_train_log.json', 'w') as fh:
         json.dump(ft_train_log, fh, indent = 2, default = float)
 
-    # validation diagnostics
     ft_rc_val = rank_correlation_oos(ft_predictor, val_dates, all_months)
     ft_rc_test = rank_correlation_oos(ft_predictor, test_dates, all_months)
     print(f'rank corr val, {ft_rc_val:.4f}')
     print(f'rank corr test, {ft_rc_test:.4f}')
 
-    # validation and test predictions saved as csv
     predict_test(ft_predictor, val_dates, all_months).to_csv(results_dir / 'ft_val_predictions.csv', index = False)
     predict_test(ft_predictor, test_dates, all_months).to_csv(results_dir / 'ft_test_predictions.csv', index = False)
     print('val and test predictions saved')
 
-    # test set portfolio simulation. The simulation runs on the full
-    # history so that the volatility overlay has a complete warm up
-    # before the test window begins. metrics are then computed on the
-    # test window slice.
-    sim = run_mean_split_simulation(ft_predictor, sorted_dates, all_months)
+    ls_seed = seed_vol_history(ft_predictor, val_dates, all_months, 'long_short')
+    lo_seed = seed_vol_history(ft_predictor, val_dates, all_months, 'long_only')
+    sim = run_mean_split_simulation(ft_predictor, test_dates, all_months, ls_seed = ls_seed, lo_seed = lo_seed, record_holdings = True)
     ls, lo = sim['long_short'], sim['long_only']
 
-    ls_scaled_full, ls_unscaled_full, ls_lev = apply_overlay_and_costs(
-        ls['returns'], ls['tc'], n_vol_periods, periods_per_year, max_leverage_long_short,
-    )
-    lo_scaled_full, lo_unscaled_full, lo_lev = apply_overlay_and_costs(
-        lo['returns'], lo['tc'], n_vol_periods, periods_per_year, max_leverage_long_only,
-    )
-
-    test_set = set(test_dates)
-    ls_mask = np.array([d in test_set for d in ls['dates']])
-    lo_mask = np.array([d in test_set for d in lo['dates']])
-
-    ls_raw_test = ls_unscaled_full[ls_mask]
-    ls_scaled_test = ls_scaled_full[ls_mask]
-    lo_raw_test = lo_unscaled_full[lo_mask]
-    lo_scaled_test = lo_scaled_full[lo_mask]
+    ls_raw_test = ls['unscaled']
+    ls_scaled_test = ls['scaled']
+    lo_raw_test = lo['unscaled']
+    lo_scaled_test = lo['scaled']
 
     ls_returns_df = pd.DataFrame({
-        'eom': [d for d, m in zip(ls['dates'], ls_mask) if m],
+        'eom': ls['dates'],
         'return_unscaled': ls_raw_test,
         'return_scaled': ls_scaled_test,
-        'leverage': ls_lev[ls_mask],
+        'leverage': ls['leverage'],
     })
     lo_returns_df = pd.DataFrame({
-        'eom': [d for d, m in zip(lo['dates'], lo_mask) if m],
+        'eom': lo['dates'],
         'return_unscaled': lo_raw_test,
         'return_scaled': lo_scaled_test,
-        'leverage': lo_lev[lo_mask],
+        'leverage': lo['leverage'],
     })
 
-    ls_hold_df = ls['holdings_df'][ls['holdings_df']['eom'].isin(test_set)].copy().reset_index(drop = True)
-    lo_hold_df = lo['holdings_df'][lo['holdings_df']['eom'].isin(test_set)].copy().reset_index(drop = True)
+    ls_hold_df = ls['holdings_df'].copy().reset_index(drop = True)
+    lo_hold_df = lo['holdings_df'].copy().reset_index(drop = True)
 
     ft_metrics = {
         'long_short_raw': portfolio_metrics(ls_raw_test, periods_per_year),
@@ -920,7 +884,6 @@ def main():
     print(f'long short vol, sharpe = {mls["sharpe"]:.4f}, ann_ret = {mls["ann_ret"] * 100:.2f}%, ann_vol = {mls["ann_vol"] * 100:.2f}%')
     print(f'long only  vol, sharpe = {mlo["sharpe"]:.4f}, ann_ret = {mlo["ann_ret"] * 100:.2f}%, ann_vol = {mlo["ann_vol"] * 100:.2f}%')
 
-    # consolidated summary written as json
     summary = {
         'construction': 'mean_split_softmax_cap_6m',
         'target_column': target_col,
@@ -975,7 +938,6 @@ def main():
         json.dump(summary, fh, indent = 2, default = float)
     print('summary saved')
 
-    # results table
     def _round_or_none(x, n):
         return None if x is None or (isinstance(x, float) and np.isnan(x)) else round(float(x), n)
 
@@ -1004,7 +966,6 @@ def main():
     print(summary_table.to_string(index = False))
     summary_table.to_csv(results_dir / 'ft_summary.csv', index = False)
 
-    # diagnostic plots
     plot_cumulative_wealth(ls_raw_test, ls_scaled_test, lo_raw_test, lo_scaled_test)
     plot_training_diagnostics(ft_log['train_losses'], ft_log['val_rank_corr'], ft_log['best_epoch'])
 
