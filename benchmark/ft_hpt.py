@@ -260,6 +260,8 @@ def seed_vol_history(predictor, month_dates, all_months, leg_kind):
 		valid = np.isfinite(pred) & np.isfinite(r)
 		n_firms = len(pred)
 		if leg_kind == 'long_only':
+			# match the live long only leg: capped softmax over the valid
+			# prediction subset, not an uncapped softmax over all firms
 			valid_pred = np.isfinite(pred)
 			lo_w = capped_softmax_weights(pred[valid_pred], max_position_weight)
 			w_full = np.zeros(n_firms, dtype = np.float64)
@@ -267,6 +269,8 @@ def seed_vol_history(predictor, month_dates, all_months, leg_kind):
 			w_full = renorm_over_valid(w_full, valid)
 			returns.append(float(np.sum(w_full[valid] * r[valid])))
 		else:
+			# match the live long short legs: mean split with capped softmax
+			# weighting within each leg, rather than an equal weighted average
 			mean_s = float(pred[np.isfinite(pred)].mean())
 			long_idx = np.where((pred > mean_s) & valid)[0]
 			short_idx = np.where((pred <= mean_s) & valid)[0]
@@ -292,7 +296,7 @@ def rank_correlation_oos(predictor, month_dates, all_months):
 		if valid.sum() < 10:
 			continue
 		result = spearmanr(pred[valid], m['r'][valid])
-		c = float(result[0])
+		c = float(result[0])                               #type: ignore
 		if not np.isnan(c):
 			corrs.append(c)
 	return float(np.mean(corrs)) if corrs else 0.0
@@ -472,6 +476,8 @@ def load_data():
 	n_feat = len(feature_cols)
 	all_months = {}
 
+	# keep every firm-month, storing an unrealised target as nan for the
+	# simulation to mask, matching eval_dual_path.py and the benchmark
 	for split_df in (train_df, val_df, test_df):
 		for eom, group in split_df.groupby('eom', sort = True):
 			if len(group) < min_stocks:
@@ -648,6 +654,15 @@ def main():
 		)
 		predictor = ft_predictor(model, device, batch_size = 1024)
 
+		# selection criterion: validation rank correlation at the early
+		# stopped epoch, computed over thousands of stock month pairs per
+		# validation month. the long short Sharpe is still computed and
+		# recorded below for reporting, but it is not what trials compete on:
+		# at a 6 month rebalance over a 5 year validation window that Sharpe
+		# comes from only about 10 non overlapping periods, far too small a
+		# sample to select the winner among many hyperparameter and early
+		# stopping combinations without the outcome being decided largely by
+		# chance. this mirrors the correction applied to the other benchmarks.
 		val_rc = float(log['best_val_rc'])
 
 		sim = run_mean_split_simulation(predictor, val_dates, all_months)

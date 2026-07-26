@@ -1,5 +1,5 @@
 portfolio,scaling,rc_test,sharpe,se,ann_ret,ann_vol,cagr,max_dd,n_obs
-long_short,unscaled,0.1551,2.3589,0.6483,18.3,7.76,18.88,0.0,9
-long_short,scaled,0.1551,1.4156,0.4716,31.17,22.02,31.71,0.0,9
-long_only,unscaled,0.1551,1.0227,0.4114,14.56,14.24,14.23,7.42,9
-long_only,scaled,0.1551,1.1051,0.423,9.24,8.36,9.15,4.41,9
+long_short,unscaled,0.1206,1.933,0.5356,14.16,7.33,14.42,0.39,10
+long_short,scaled,0.1206,1.2989,0.4294,26.74,20.59,26.83,0.85,10
+long_only,unscaled,0.1206,0.9353,0.3791,12.73,13.62,12.35,7.51,10
+long_only,scaled,0.1206,0.999,0.3872,8.09,8.1,7.97,4.48,10

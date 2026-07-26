@@ -6,6 +6,6 @@
   "val_end": "2020-12-31",
   "n_val_months": 60,
   "test_start": "2021-01-31",
-  "test_end": "2025-06-30",
-  "n_test_months": 54
+  "test_end": "2025-12-31",
+  "n_test_months": 60
 }

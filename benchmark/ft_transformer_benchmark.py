@@ -1,3 +1,12 @@
+"""
+Feature Tokeniser Transformer benchmark on the Emerging Markets universe.
+
+Final training and test set evaluation against the cumulative six month
+forward excess return, with mean split selection, capped softmax
+weighting, and the same volatility overlay protocol used by the Dual Path
+Portfolio Transformer's six month head. Reads ft_best_params.json
+produced by ft_hpt.py.
+"""
 
 import json
 import math
@@ -22,6 +31,8 @@ warnings.filterwarnings('ignore')
 matplotlib.rcParams['font.size'] = 12
 
 
+# configuration
+
 train_path = Path('data/processed/train.parquet')
 val_path = Path('data/processed/val.parquet')
 test_path = Path('data/processed/test.parquet')
@@ -29,12 +40,17 @@ test_path = Path('data/processed/test.parquet')
 results_dir = Path('results/benchmark/ft_transformer_benchmark')
 results_dir.mkdir(parents = True, exist_ok = True)
 
+# the DPPT preprocessing pipeline computes the cumulative six month forward
+# excess return as target_6m and writes it to every processed parquet split.
+# we read it directly rather than reconstructing it from monthly returns.
 target_col = 'target_6m'
 
+# rebalance frequency and horizon are six months, matching the DPPT 6m head
 rebalance_freq = 6
 tc_bps = 25
 min_stocks = 30
 
+# volatility overlay parameters
 target_vol = 0.10
 vol_lookback_months = 36
 n_vol_periods = max(1, vol_lookback_months // rebalance_freq)
@@ -52,11 +68,14 @@ torch_seed = 48
 run_timestamp = datetime.utcnow().isoformat(timespec = 'seconds')
 
 
+# device
 cuda_available = torch.cuda.is_available()
 device = torch.device('cuda' if cuda_available else 'cpu')
 cuda_device_name = torch.cuda.get_device_name(0) if cuda_available else None
 use_amp = cuda_available
 
+
+# model classes
 
 class ReGLU(nn.Module):
     def forward(self, x):
@@ -146,7 +165,11 @@ class FTPredictor:
         return np.concatenate(preds, axis = 0)
 
 
+# portfolio construction helpers, mirroring eval_dual_path.py
+
 def _capped_softmax_weights(scores, max_weight, max_iter = 20):
+    """Iterative softmax with a per position cap. Mirrors the DPPT helper
+    in eval_dual_path.py."""
     scores = np.asarray(scores, dtype = np.float64)
     n = scores.shape[0]
     if n == 0:
@@ -174,6 +197,8 @@ def _capped_softmax_weights(scores, max_weight, max_iter = 20):
 
 
 def _renorm_over_valid(weights, valid):
+    """Redistribute the weight of firms with invalid forward returns onto
+    the remaining firms proportionally."""
     weights = np.asarray(weights, dtype = np.float64)
     valid = np.asarray(valid, dtype = bool)
     if not valid.any():
@@ -187,6 +212,9 @@ def _renorm_over_valid(weights, valid):
 
 
 def _drift_weights(prev_ids, prev_w, realised_by_id):
+    """Grow each previously held weight by its realised return over the
+    elapsed period, then renormalise. Mirrors _drift_weights in
+    eval_dual_path.py."""
     if prev_ids is None or prev_w is None or len(prev_w) == 0:
         return None, None
     n = len(prev_w)
@@ -202,6 +230,10 @@ def _drift_weights(prev_ids, prev_w, realised_by_id):
 
 
 def _weight_l1_turnover(prev_ids, prev_w, curr_ids, curr_w):
+    """L1 distance between the drifted incumbent weights and the freshly
+    formed target weights, summed over the union of firm identifiers.
+    Mirrors _weight_l1_turnover in eval_dual_path.py. Collapses to the
+    entry cost at the first rebalance."""
     if curr_ids is None or curr_w is None or len(curr_w) == 0:
         return 0.0
     curr_map = {int(curr_ids[j]): float(curr_w[j]) for j in range(len(curr_ids))}
@@ -213,6 +245,13 @@ def _weight_l1_turnover(prev_ids, prev_w, curr_ids, curr_w):
 
 
 def portfolio_metrics(rets, periods_per_year):
+    """Annualised portfolio metrics on a period return series. Sharpe uses
+    the arithmetic mean, since the geometric mean is systematically below
+    the arithmetic mean by approximately variance over two (Jensen), so
+    using the CAGR would overstate the Sharpe ratio. The geometric CAGR is
+    reported separately under the cagr field. The standard deviation uses
+    ddof equal to one, matching the DPPT main model's
+    compute_portfolio_metrics."""
     rets = np.asarray(rets, dtype = np.float64)
     if len(rets) == 0:
         return {}
@@ -240,6 +279,10 @@ def portfolio_metrics(rets, periods_per_year):
 
 
 def _overlay_leverage(raw_hist, periods_per_year, max_leverage):
+    """Volatility targeted leverage from the trailing raw return history,
+    mirroring the inline overlay in eval_dual_path.py. Leverage stays at
+    1.0 until n_vol_periods raw returns have accumulated, which the
+    validation seed supplies from the first test rebalance."""
     if len(raw_hist) >= n_vol_periods:
         recent = np.array(raw_hist[-n_vol_periods:])
         realised_vol = recent.std(ddof = 1) * np.sqrt(periods_per_year)
@@ -249,6 +292,12 @@ def _overlay_leverage(raw_hist, periods_per_year, max_leverage):
 
 
 def seed_vol_history(predictor, month_dates, all_months, leg_kind):
+    """Trailing raw, pre leverage returns from the validation window, used
+    to warm the overlay so leverage is active from the first test
+    rebalance. Mirrors _seed_vol_history in eval_dual_path.py. The long
+    only leg uses an uncapped softmax and the long short leg uses an equal
+    weighted mean split, both without the position cap, as in the DPPT
+    seeding routine."""
     returns = []
     for pos, eom in enumerate(month_dates):
         if pos % rebalance_freq != 0:
@@ -307,6 +356,13 @@ def rank_correlation_oos(predictor, month_dates, all_months):
 
 
 def run_mean_split_simulation(predictor, month_dates, all_months, ls_seed = None, lo_seed = None, record_holdings = False):
+    """Mean split long short and full universe long only, with capped
+    softmax weighting, drift aware L1 turnover, and a volatility overlay
+    seeded from the validation window. This mirrors
+    portfolio_simulation and portfolio_simulation_long_short in
+    eval_dual_path.py so the resulting Sharpe ratios are measured on the
+    same construction as the Dual Path model. One observation per
+    rebalance_freq months, anchored at the first supplied date."""
     ls_scaled, ls_unscaled, ls_dates, ls_lev = [], [], [], []
     lo_scaled, lo_unscaled, lo_dates, lo_lev = [], [], [], []
     raw_ls_hist = list(ls_seed) if ls_seed else []
@@ -337,6 +393,7 @@ def run_mean_split_simulation(predictor, month_dates, all_months, ls_seed = None
         valid = valid_pred & np.isfinite(r)
         rb += 1
 
+        # long short by mean split, capped softmax within each leg
         mean_score = float(pred[valid_pred].mean())
         long_idx = np.where((pred > mean_score) & valid_pred)[0]
         short_idx = np.where((pred <= mean_score) & valid_pred)[0]
@@ -374,6 +431,7 @@ def run_mean_split_simulation(predictor, month_dates, all_months, ls_seed = None
         prev_long_ids, prev_long_w, prev_long_realised = long_ids, long_w, long_realised
         prev_short_ids, prev_short_w, prev_short_realised = short_ids, short_w, short_realised
 
+        # long only over the full universe, capped softmax on the raw score
         lo_w = _capped_softmax_weights(pred[valid_pred], max_position_weight)
         lo_w_full = np.zeros(n_firms, dtype = np.float64)
         lo_w_full[valid_pred] = lo_w
@@ -425,21 +483,55 @@ def run_mean_split_simulation(predictor, month_dates, all_months, ls_seed = None
     }
 
 
+# data loading
+
 def load_data():
+    """Load the three DPPT-processed parquet splits. Characteristics are
+    already cross-sectionally rank-normalised and median-imputed by the DPPT
+    preprocessing pipeline, so no further normalisation is applied here.
+    The six month forward return target is read directly from the target_6m
+    column written by the DPPT pipeline; no target reconstruction is needed."""
     train_schema = pq.read_schema(train_path)
     non_feature = {
+        # identifiers
         'id', 'gvkey', 'iid', 'isin', 'cusip', 'permno', 'permco',
+        # dates, country, currency, size grouping
         'eom', 'date', 'excntry', 'curcd', 'size_grp',
+        # raw monthly return columns; excluded because ret_exc_lead1m was
+        # used for target construction in the previous approach and
+        # ret_exc_lead6m was the old target name; both are superseded by
+        # target_6m and must not appear as features
         'ret_exc_lead1m', 'ret_exc_lead6m',
+        # DPPT-preprocessed forward return targets. target_6m is the
+        # prediction target and is excluded via target_col; the others are
+        # excluded as direct correlates of the training target that would
+        # cause look-ahead leakage if left in the feature set
         'target_1m', 'target_3m', 'target_6m', 'target_12m',
+        # industry classification codes, encoded as float but categorical
         'sic', 'naics', 'gics', 'ff49',
+        # exchange and share classification codes, also categorical
         'comp_tpci', 'crsp_shrcd', 'comp_exchg', 'crsp_exchcd',
+        # filter and quality indicators, used for sample selection only
         'obs_main', 'exch_main', 'primary_sec', 'common', 'bidask',
         'source_crsp',
+        # return calculation metadata
         'adjfct', 'fx', 'ret_lag_dif',
+        # raw same period returns, redundant with the ret_1_0 short term
+        # reversal characteristic and not cross sectionally rank normalised
         'ret', 'ret_exc', 'ret_local',
+        # level forms of characteristics, redundant with the ranked
+        # characteristics that already derive from them
         'me', 'me_company', 'prc', 'prc_local', 'prc_high', 'prc_low',
         'dolvol', 'shares', 'tvol',
+        # raw accounting aggregates in dollar terms. these are excluded
+        # from characteristic processing in the DPPT preprocessing
+        # pipeline and therefore never pass through cross_sectional_normalise,
+        # so they remain in the processed parquet as unranked, unbounded
+        # dollar magnitudes rather than characteristics on a common scale.
+        # including them here would feed the feature tokeniser a handful
+        # of inputs with a completely different distribution from every
+        # other feature, and would make the feature set inconsistent with
+        # the K0 and K1 characteristic set DPPT itself trains on
         'enterprise_value', 'book_equity', 'assets', 'sales',
         'net_income', 'intrinsic_value',
     }
@@ -470,6 +562,7 @@ def load_data():
     print(f'val rows, {len(val_df):,}')
     print(f'test rows, {len(test_df):,}')
 
+    # sanity check the precomputed target
     for label, split in [('train', train_df), ('val', val_df), ('test', test_df)]:
         non_null = split[target_col].notna().sum()
         print(
@@ -484,6 +577,13 @@ def load_data():
     n_feat = len(feature_cols)
     all_months = {}
 
+    # build per-month cross sections keeping every firm, including those
+    # whose six month forward target is not yet realised at the end of the
+    # sample. The target is stored as is, so r carries nan for those firms,
+    # and the simulation masks them through _renorm_over_valid exactly as
+    # eval_dual_path.py does. This retains the final rebalances the Dual
+    # Path evaluation also forms, so the reported observation count matches
+    # the other models rather than dropping the target truncated tail.
     for split_df in (train_df, val_df, test_df):
         for eom, group in split_df.groupby('eom', sort = True):
             if len(group) < min_stocks:
@@ -501,6 +601,9 @@ def load_data():
 
     x_train_full = np.vstack([all_months[d]['x'] for d in train_dates])
     y_train_full = np.concatenate([all_months[d]['r'] for d in train_dates]).astype(np.float32)
+    # train only on firm-months whose forward target is realised. The
+    # months stay in all_months so the test simulation can still form its
+    # final, target truncated rebalances.
     train_mask = np.isfinite(y_train_full)
     x_train = x_train_full[train_mask]
     y_train = y_train_full[train_mask]
@@ -519,6 +622,7 @@ def load_data():
 
 
 def save_training_data(data):
+    """Save the rank normalised training observations and metadata."""
     feature_cols = data['feature_cols']
     train_dates = data['train_dates']
     val_dates = data['val_dates']
@@ -553,6 +657,7 @@ def save_training_data(data):
 
 
 def save_test_inputs(data):
+    """Save rank normalised inputs for every firm month in the test set."""
     feature_cols = data['feature_cols']
     test_dates = data['test_dates']
     all_months = data['all_months']
@@ -589,8 +694,13 @@ def save_test_inputs(data):
         }, fh, indent = 2)
 
 
+# training function
+
 def train_ft_transformer(params, x_train_pool, y_train_pool, val_dates_local,
                          all_months, n_epochs, patience, device, seed, n_features):
+    """Train a Feature Tokeniser Transformer with the given hyperparameters
+    and early stopping on the validation rank correlation. Returns the
+    trained model and a dictionary of training diagnostics."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     if device.type == 'cuda':
@@ -693,6 +803,8 @@ def train_ft_transformer(params, x_train_pool, y_train_pool, val_dates_local,
     }
 
 
+# plotting helpers
+
 def configure_plot_style():
     plt.rcParams.update({
         'mathtext.fontset': 'cm',
@@ -751,6 +863,8 @@ def plot_training_diagnostics(train_losses, val_rank_corr, best_epoch):
     print('training diagnostics plot saved')
 
 
+# main routine
+
 def main():
     print(f'torch, {torch.__version__}')
     print(f'cuda available, {cuda_available}')
@@ -763,6 +877,7 @@ def main():
     print(f'periods_per_year, {periods_per_year}')
     print(f'n_vol_periods, {n_vol_periods}')
 
+    # load data and save the training data artefacts
     data = load_data()
     save_training_data(data)
     save_test_inputs(data)
@@ -776,6 +891,7 @@ def main():
     test_dates = data['test_dates']
     n_feat = data['n_feat']
 
+    # load the best hyperparameters produced by ft_hpt.py
     best_params_path = results_dir / 'ft_best_params.json'
     if not best_params_path.exists():
         raise FileNotFoundError(
@@ -794,6 +910,7 @@ def main():
     ft_best = best_data['best_params']
     print(f'best params loaded, {ft_best}')
 
+    # final training with the best hyperparameters
     t0 = time.time()
     ft_model, ft_log = train_ft_transformer(
         params = ft_best,
@@ -813,9 +930,11 @@ def main():
     print(f'final model trained in {ft_train_time:.1f} s')
     print(f'parameter count, {n_params:,}')
 
+    # model weights saved as safetensors
     safetensors_save(ft_model.state_dict(), str(results_dir / 'ft_weights.safetensors'))
     print('weights saved, ft_weights.safetensors')
 
+    # training log written as json
     ft_train_log = {
         'construction': 'mean_split_softmax_cap_6m',
         'target_column': target_col,
@@ -832,15 +951,22 @@ def main():
     with open(results_dir / 'ft_train_log.json', 'w') as fh:
         json.dump(ft_train_log, fh, indent = 2, default = float)
 
+    # validation diagnostics
     ft_rc_val = rank_correlation_oos(ft_predictor, val_dates, all_months)
     ft_rc_test = rank_correlation_oos(ft_predictor, test_dates, all_months)
     print(f'rank corr val, {ft_rc_val:.4f}')
     print(f'rank corr test, {ft_rc_test:.4f}')
 
+    # validation and test predictions saved as csv
     predict_test(ft_predictor, val_dates, all_months).to_csv(results_dir / 'ft_val_predictions.csv', index = False)
     predict_test(ft_predictor, test_dates, all_months).to_csv(results_dir / 'ft_test_predictions.csv', index = False)
     print('val and test predictions saved')
 
+    # test set portfolio simulation. The volatility overlay is seeded from
+    # the validation window so leverage is active from the first test
+    # rebalance, and the rebalance grid is anchored at the first test
+    # month. Construction, turnover, and overlay therefore agree with
+    # eval_dual_path.py and the Sharpe ratios are directly comparable.
     ls_seed = seed_vol_history(ft_predictor, val_dates, all_months, 'long_short')
     lo_seed = seed_vol_history(ft_predictor, val_dates, all_months, 'long_only')
     sim = run_mean_split_simulation(ft_predictor, test_dates, all_months, ls_seed = ls_seed, lo_seed = lo_seed, record_holdings = True)
@@ -884,6 +1010,7 @@ def main():
     print(f'long short vol, sharpe = {mls["sharpe"]:.4f}, ann_ret = {mls["ann_ret"] * 100:.2f}%, ann_vol = {mls["ann_vol"] * 100:.2f}%')
     print(f'long only  vol, sharpe = {mlo["sharpe"]:.4f}, ann_ret = {mlo["ann_ret"] * 100:.2f}%, ann_vol = {mlo["ann_vol"] * 100:.2f}%')
 
+    # consolidated summary written as json
     summary = {
         'construction': 'mean_split_softmax_cap_6m',
         'target_column': target_col,
@@ -938,6 +1065,7 @@ def main():
         json.dump(summary, fh, indent = 2, default = float)
     print('summary saved')
 
+    # results table
     def _round_or_none(x, n):
         return None if x is None or (isinstance(x, float) and np.isnan(x)) else round(float(x), n)
 
@@ -966,6 +1094,7 @@ def main():
     print(summary_table.to_string(index = False))
     summary_table.to_csv(results_dir / 'ft_summary.csv', index = False)
 
+    # diagnostic plots
     plot_cumulative_wealth(ls_raw_test, ls_scaled_test, lo_raw_test, lo_scaled_test)
     plot_training_diagnostics(ft_log['train_losses'], ft_log['val_rank_corr'], ft_log['best_epoch'])
 

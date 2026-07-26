@@ -1,7 +1,7 @@
 {
   "construction": "mean_split_softmax_cap_6m",
   "target_column": "target_6m",
-  "run_timestamp_utc": "2026-07-03T13:02:35",
+  "run_timestamp_utc": "2026-07-14T09:27:56",
   "n_features": 304,
   "feature_cols": [
     "market_equity",
@@ -314,9 +314,9 @@
     "n_heads": 4,
     "d_model": 32,
     "d_ff": 128,
-    "n_layers": 2,
-    "dropout": 0.251181647470428,
-    "parameter_count": 44993
+    "n_layers": 3,
+    "dropout": 0.17625915357156158,
+    "parameter_count": 70305
   },
   "split": {
     "train": {
@@ -332,8 +332,8 @@
     },
     "test": {
       "start": "2021-01-31",
-      "end": "2025-06-30",
-      "n_months": 54
+      "end": "2025-12-31",
+      "n_months": 60
     }
   },
   "config": {
@@ -358,57 +358,57 @@
       "n_heads": 4,
       "d_model_per_head": 8,
       "d_ff_ratio": 4,
-      "n_layers": 2,
-      "dropout": 0.251181647470428,
-      "batch_size": 128,
-      "learning_rate": 0.0009630619328293385,
-      "weight_decay": 1.755294192817726e-06
+      "n_layers": 3,
+      "dropout": 0.17625915357156158,
+      "batch_size": 512,
+      "learning_rate": 0.0002627111859266744,
+      "weight_decay": 0.0002908992041150531
     },
-    "final_training_time_seconds": 604.7987804412842,
-    "best_epoch": 2,
-    "n_epochs_run": 11,
-    "rc_val": 0.12216409753414945,
-    "rc_test": 0.15508136568951336,
+    "final_training_time_seconds": 549.0814733505249,
+    "best_epoch": 0,
+    "n_epochs_run": 9,
+    "rc_val": 0.11144615244107599,
+    "rc_test": 0.12057095289181713,
     "portfolio_metrics": {
       "long_short_raw": {
-        "ann_ret": 0.18302010438600672,
-        "ann_vol": 0.07758682957563896,
-        "sharpe": 2.358906858123149,
-        "se_sharpe": 0.648264416444248,
-        "max_dd": 0.0,
-        "cagr": 0.18881300427128545,
-        "cumulative_return": 1.1777647409889997,
-        "n_obs": 9
+        "ann_ret": 0.14161353005312438,
+        "ann_vol": 0.07325927274231572,
+        "sharpe": 1.9330458077469577,
+        "se_sharpe": 0.5355682073670958,
+        "max_dd": 0.003860266311510568,
+        "cagr": 0.14423932298684994,
+        "cumulative_return": 0.9614820735436049,
+        "n_obs": 10
       },
       "long_short_scaled": {
-        "ann_ret": 0.31169021887946,
-        "ann_vol": 0.2201871507191211,
-        "sharpe": 1.4155695183006554,
-        "se_sharpe": 0.4716305675904222,
-        "max_dd": 0.0,
-        "cagr": 0.317124470088346,
-        "cumulative_return": 2.4539868714880595,
-        "n_obs": 9
+        "ann_ret": 0.26743927561835745,
+        "ann_vol": 0.20589024769427897,
+        "sharpe": 1.29894095817239,
+        "se_sharpe": 0.42937440613163047,
+        "max_dd": 0.00854321901045292,
+        "cagr": 0.2683403530368842,
+        "cumulative_return": 2.282305875081844,
+        "n_obs": 10
       },
       "long_only_raw": {
-        "ann_ret": 0.14559124576432653,
-        "ann_vol": 0.1423614816518978,
-        "sharpe": 1.0226870644710353,
-        "se_sharpe": 0.4113587804011632,
-        "max_dd": 0.07424765750563862,
-        "cagr": 0.1423415575737481,
-        "cumulative_return": 0.8200440274243859,
-        "n_obs": 9
+        "ann_ret": 0.12734811180940014,
+        "ann_vol": 0.13615617123217255,
+        "sharpe": 0.935309142853665,
+        "se_sharpe": 0.3791307948917931,
+        "max_dd": 0.07508689244802215,
+        "cagr": 0.12353383028844256,
+        "cumulative_return": 0.7903204363112823,
+        "n_obs": 10
       },
       "long_only_scaled": {
-        "ann_ret": 0.092385303835377,
-        "ann_vol": 0.08359962650573916,
-        "sharpe": 1.1050923036005993,
-        "se_sharpe": 0.4230332925877426,
-        "max_dd": 0.0441324587762057,
-        "cagr": 0.09146294500527885,
-        "cumulative_return": 0.48265628293405616,
-        "n_obs": 9
+        "ann_ret": 0.08092891977466063,
+        "ann_vol": 0.08101294630008911,
+        "sharpe": 0.9989628012649086,
+        "se_sharpe": 0.3871644791500786,
+        "max_dd": 0.04481031300847513,
+        "cagr": 0.0796769032575595,
+        "cumulative_return": 0.46713154368345333,
+        "n_obs": 10
       }
     }
   }
