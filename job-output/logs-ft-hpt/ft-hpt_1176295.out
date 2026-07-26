@@ -1,0 +1,23 @@
+device , cuda
+device name , NVIDIA L40
+mixed precision , enabled
+run timestamp utc , 2026-07-16T14:11:54
+results_dir , results/benchmark/ft_transformer_benchmark
+n_trials , 30
+construction , mean_split_softmax_cap_6m
+periods_per_year , 2.0
+n_vol_periods , 6
+feature columns selected , 304
+train rows , 1707212
+val rows , 914776
+test rows , 1115424
+train target_6m non-null , 1628694 , 95.4
+val target_6m non-null , 875003 , 95.7
+test target_6m non-null , 979841 , 87.8
+x_train shape , (1628694, 304)
+best val rank corr , 0.1411
+best params , {'n_heads': 8, 'd_model_per_head': 32, 'd_ff_ratio': 4, 'n_layers': 1, 'dropout': 0.033736153339330485, 'batch_size': 256, 'learning_rate': 0.001144589057689504, 'weight_decay': 1.955210591253963e-06}
+hpo time , 43149.3 s , 719.16 min
+best params saved , ft_best_params.json
+optuna trials saved , ft_optuna_trials.csv
+optuna study saved , ft_optuna_study.pkl

@@ -1,0 +1,48 @@
+device , cuda
+device name , NVIDIA L40
+mixed precision , enabled
+run timestamp utc , 2026-07-07T01:48:55
+results_dir , results-USA/ft_transformer_benchmark
+n_trials , 30
+construction , mean_split_softmax_cap_6m
+periods_per_year , 2.0
+n_vol_periods , 6
+preprocessing raw panel, data/Global Factor_USA.parquet
+raw shape, 2,075,188 rows x 443 columns
+removed 1 duplicate (id, eom) observations
+K0 retained, 72 of 85
+K1 retained, 275 of 312
+train, 1,497,714 rows, 1995-01-31 to 2015-12-31
+val, 267,407 rows, 2016-01-31 to 2020-12-31
+test, 310,066 rows, 2021-01-31 to 2025-12-31
+train, dropped 158,786 rows with more than 33% missing characteristics
+val, dropped 20,745 rows with more than 33% missing characteristics
+test, dropped 44,128 rows with more than 33% missing characteristics
+normalising train
+50/252 months normalised
+100/252 months normalised
+150/252 months normalised
+200/252 months normalised
+250/252 months normalised
+252/252 months normalised
+normalising val
+50/60 months normalised
+60/60 months normalised
+normalising test
+50/60 months normalised
+60/60 months normalised
+retained characteristics, 347
+feature columns, characteristics plus missingness flags, 694
+train rows , 1338928
+val rows , 246662
+test rows , 265938
+train target_6m non-null , 1268413 , 94.7
+val target_6m non-null , 234041 , 94.9
+test target_6m non-null , 229842 , 86.4
+x_train shape , (1268413, 694)
+best val ls sharpe , 0.3149
+best params , {'n_heads': 8, 'd_model_per_head': 32, 'd_ff_ratio': 2, 'n_layers': 1, 'dropout': 0.1803015823054822, 'batch_size': 512, 'learning_rate': 0.0018161087835837089, 'weight_decay': 0.0004805176555428117}
+hpo time , 108936.9 s , 1815.62 min
+best params saved , ft_best_params.json
+optuna trials saved , ft_optuna_trials.csv
+optuna study saved , ft_optuna_study.pkl

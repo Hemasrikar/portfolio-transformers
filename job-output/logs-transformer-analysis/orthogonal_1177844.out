@@ -1,0 +1,117 @@
+K0 characteristics, 55
+K1 characteristics, 97
+Validation months, 60
+Test months, 60
+Pooled months, validation plus test, 120
+Variant, fourier, seeds, 5
+Variant, linear, seeds, 5
+Variant, per_feature, seeds, 5
+Variant, periodic, seeds, 5
+Variant, ple, seeds, 5
+fourier
+window   n  b1_base  b1_full  b2_full  rc_base  rc_combined
+   val  60   0.0378   0.0301 0.0110     0.1338       0.1259
+  test  54   0.0355   0.0208 0.0231     0.1316       0.1159
+pooled 114   0.0367   0.0257 0.0167 .   0.1327       0.1212
+
+fourier, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.59722          NA        NA          NA  
+entropy ratio vs uniform (1)     0.67535     0.00410   -79.140      0.0000 ***
+missingness excess vs zero    -0.00810     0.00084    -9.682      0.0000 ***
+r squared, base only           0.02072          NA        NA          NA  
+r squared, full                0.03343          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+linear
+window   n  b1_base  b1_full  b2_full  rc_base  rc_combined
+   val  60   0.0350   0.0312 0.0054     0.1288       0.1527
+  test  54   0.0362   0.0346 0.0014     0.1346       0.1264
+pooled 114   0.0355   0.0328 0.0035     0.1315       0.1402
+
+linear, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.70862          NA        NA          NA  
+entropy ratio vs uniform (1)     0.98840     0.00007  -167.161      0.0000 ***
+missingness excess vs zero    -0.00189     0.00009   -19.919      0.0000 ***
+r squared, base only           0.01959          NA        NA          NA  
+r squared, full                0.02688          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+per_feature
+window   n  b1_base  b1_full   b2_full  rc_base  rc_combined
+   val  60   0.0350   0.0341  0.0012     0.1197       0.1318
+  test  54   0.0373   0.0394 -0.0045     0.1314       0.1117
+pooled 114   0.0361   0.0366 -0.0015     0.1252       0.1223
+
+per_feature, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.60688          NA        NA          NA  
+entropy ratio vs uniform (1)     0.99592     0.00003  -116.868      0.0000 ***
+missingness excess vs zero    -0.00088     0.00005   -17.002      0.0000 ***
+r squared, base only           0.01963          NA        NA          NA  
+r squared, full                0.02702          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+periodic
+window   n  b1_base  b1_full   b2_full  rc_base  rc_combined
+   val  60   0.0340   0.0364 -0.0032     0.1317       0.1450
+  test  54   0.0349   0.0452 -0.0111     0.1392       0.1320
+pooled 114   0.0344   0.0406 -0.0070     0.1353       0.1389
+
+periodic, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.84184          NA        NA          NA  
+entropy ratio vs uniform (1)     0.99288     0.00008   -93.112      0.0000 ***
+missingness excess vs zero    -0.00109     0.00005   -23.730      0.0000 ***
+r squared, base only           0.01867          NA        NA          NA  
+r squared, full                0.02440          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+ple
+window   n  b1_base  b1_full  b2_full  rc_base  rc_combined
+   val  60   0.0361   0.0342 0.0033     0.1076       0.1195
+  test  54   0.0418   0.0331 0.0137 .   0.1226       0.1348
+pooled 114   0.0388   0.0336 0.0082 .   0.1147       0.1267
+
+ple, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.57608          NA        NA          NA  
+entropy ratio vs uniform (1)     0.96122     0.00051   -75.568      0.0000 ***
+missingness excess vs zero    -0.00245     0.00012   -20.200      0.0000 ***
+r squared, base only           0.01638          NA        NA          NA  
+r squared, full                0.02050          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+summary written, results1/transformer/score_orthogonality_summary.csv, 15 rows across the val, test, and pooled windows
+monthly detail written, results1/transformer/score_orthogonality_monthly.csv
+
+model comparison, mlp benchmark vs dppt, test window only
+                     model  rank_corr  sharpe_ls  se_ls  sharpe_lo  n_obs_ls
+             mlp benchmark     0.1287     1.9472 0.5381     1.0271        10
+     fourier, base_6m only     0.1316        NaN    NaN        NaN      <NA>
+    fourier, path2_6m only     0.1137        NaN    NaN        NaN      <NA>
+         fourier, combined     0.1159     1.0494 0.3938     0.6782        10
+      linear, base_6m only     0.1346        NaN    NaN        NaN      <NA>
+     linear, path2_6m only     0.1232        NaN    NaN        NaN      <NA>
+          linear, combined     0.1264     2.2067 0.5861     1.6282        10
+ per_feature, base_6m only     0.1314        NaN    NaN        NaN      <NA>
+per_feature, path2_6m only     0.1031        NaN    NaN        NaN      <NA>
+     per_feature, combined     0.1117     1.9506 0.5387     1.9354        10
+    periodic, base_6m only     0.1392        NaN    NaN        NaN      <NA>
+   periodic, path2_6m only     0.1233        NaN    NaN        NaN      <NA>
+        periodic, combined     0.1320     1.9635 0.5411     2.2834        10
+         ple, base_6m only     0.1226        NaN    NaN        NaN      <NA>
+        ple, path2_6m only     0.1268        NaN    NaN        NaN      <NA>
+             ple, combined     0.1348     2.0595 0.5586     1.7884        10
+
+sharpe difference vs mlp benchmark, long short, scaled, z test
+                              estimate  std. error   t value    pr(>|t|)
+fourier, combined vs mlp      -0.89780     0.66679    -1.346      0.1782  
+linear, combined vs mlp        0.25946     0.79563     0.326      0.7443  
+per_feature, combined vs mlp     0.00335     0.76144     0.004      0.9965  
+periodic, combined vs mlp      0.01625     0.76309     0.021      0.9830  
+ple, combined vs mlp           0.11226     0.77564     0.145      0.8849  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+mlp comparison written, results1/transformer/score_orthogonality_mlp_comparison.csv

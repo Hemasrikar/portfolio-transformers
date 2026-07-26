@@ -1,0 +1,186 @@
+K0 characteristics, 55
+K1 characteristics, 97
+Validation months, 60
+Test months, 60
+Pooled months, validation plus test, 120
+Variant, fourier, seeds, 5
+Variant, linear, seeds, 5
+Variant, per_feature, seeds, 5
+Variant, periodic, seeds, 5
+Variant, ple, seeds, 5
+variant, fourier, months, 114, validation, 60, test, 54
+
+regression of target_6m on the standardised scores
+                              estimate  std. error   t value    pr(>|t|)
+b1, base_6m only               0.03669     0.00784     4.682      0.0000 ***
+b1, base_6m in full model      0.02571     0.00817     3.147      0.0021 **
+b2, path2_6m in full model     0.01673     0.00909     1.841      0.0682 .
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+r squared, base only, 0.02072   r squared, full, 0.03343   incremental, 0.01271
+
+path 2 diagnostics, tested against their natural null value
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.59722          NA        NA          NA  
+rank corr, base_6m vs path2_6m     0.60440          NA        NA          NA  
+entropy ratio vs uniform (1)     0.67535     0.00410   -79.140      0.0000 ***
+missingness excess vs zero    -0.00810     0.00084    -9.682      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+rank correlation of each score against target_6m, vs zero
+                              estimate  std. error   t value    pr(>|t|)
+rank corr, base_6m             0.13273     0.02431     5.459      0.0000 ***
+rank corr, path2_6m            0.11871     0.02722     4.361      0.0000 ***
+rank corr, combined scores_6m     0.12116     0.02718     4.458      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+
+variant, linear, months, 114, validation, 60, test, 54
+
+regression of target_6m on the standardised scores
+                              estimate  std. error   t value    pr(>|t|)
+b1, base_6m only               0.03553     0.00769     4.618      0.0000 ***
+b1, base_6m in full model      0.03281     0.01305     2.515      0.0133 *
+b2, path2_6m in full model     0.00352     0.00874     0.403      0.6879  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+r squared, base only, 0.01959   r squared, full, 0.02688   incremental, 0.00728
+
+path 2 diagnostics, tested against their natural null value
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.70862          NA        NA          NA  
+rank corr, base_6m vs path2_6m     0.71867          NA        NA          NA  
+entropy ratio vs uniform (1)     0.98840     0.00007  -167.161      0.0000 ***
+missingness excess vs zero    -0.00189     0.00009   -19.919      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+rank correlation of each score against target_6m, vs zero
+                              estimate  std. error   t value    pr(>|t|)
+rank corr, base_6m             0.13154     0.02406     5.468      0.0000 ***
+rank corr, path2_6m            0.13813     0.01464     9.438      0.0000 ***
+rank corr, combined scores_6m     0.14024     0.01504     9.323      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+
+variant, per_feature, months, 114, validation, 60, test, 54
+
+regression of target_6m on the standardised scores
+                              estimate  std. error   t value    pr(>|t|)
+b1, base_6m only               0.03608     0.00783     4.606      0.0000 ***
+b1, base_6m in full model      0.03663     0.01166     3.141      0.0021 **
+b2, path2_6m in full model    -0.00153     0.00735    -0.209      0.8350  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+r squared, base only, 0.01963   r squared, full, 0.02702   incremental, 0.00739
+
+path 2 diagnostics, tested against their natural null value
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.60688          NA        NA          NA  
+rank corr, base_6m vs path2_6m     0.62037          NA        NA          NA  
+entropy ratio vs uniform (1)     0.99592     0.00003  -116.868      0.0000 ***
+missingness excess vs zero    -0.00088     0.00005   -17.002      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+rank correlation of each score against target_6m, vs zero
+                              estimate  std. error   t value    pr(>|t|)
+rank corr, base_6m             0.12524     0.02476     5.058      0.0000 ***
+rank corr, path2_6m            0.11561     0.01190     9.718      0.0000 ***
+rank corr, combined scores_6m     0.12230     0.01312     9.323      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+
+variant, periodic, months, 114, validation, 60, test, 54
+
+regression of target_6m on the standardised scores
+                              estimate  std. error   t value    pr(>|t|)
+b1, base_6m only               0.03441     0.00763     4.511      0.0000 ***
+b1, base_6m in full model      0.04057     0.01217     3.334      0.0012 **
+b2, path2_6m in full model    -0.00697     0.01001    -0.697      0.4875  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+r squared, base only, 0.01867   r squared, full, 0.02440   incremental, 0.00573
+
+path 2 diagnostics, tested against their natural null value
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.84184          NA        NA          NA  
+rank corr, base_6m vs path2_6m     0.83310          NA        NA          NA  
+entropy ratio vs uniform (1)     0.99288     0.00008   -93.112      0.0000 ***
+missingness excess vs zero    -0.00109     0.00005   -23.730      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+rank correlation of each score against target_6m, vs zero
+                              estimate  std. error   t value    pr(>|t|)
+rank corr, base_6m             0.13527     0.02418     5.594      0.0000 ***
+rank corr, path2_6m            0.13499     0.02119     6.369      0.0000 ***
+rank corr, combined scores_6m     0.13885     0.02212     6.277      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+
+variant, ple, months, 114, validation, 60, test, 54
+
+regression of target_6m on the standardised scores
+                              estimate  std. error   t value    pr(>|t|)
+b1, base_6m only               0.03880     0.00607     6.396      0.0000 ***
+b1, base_6m in full model      0.03364     0.00602     5.585      0.0000 ***
+b2, path2_6m in full model     0.00821     0.00474     1.733      0.0859 .
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+r squared, base only, 0.01638   r squared, full, 0.02050   incremental, 0.00412
+
+path 2 diagnostics, tested against their natural null value
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.57608          NA        NA          NA  
+rank corr, base_6m vs path2_6m     0.62518          NA        NA          NA  
+entropy ratio vs uniform (1)     0.96122     0.00051   -75.568      0.0000 ***
+missingness excess vs zero    -0.00245     0.00012   -20.200      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+rank correlation of each score against target_6m, vs zero
+                              estimate  std. error   t value    pr(>|t|)
+rank corr, base_6m             0.11468     0.01587     7.224      0.0000 ***
+rank corr, path2_6m            0.12076     0.01902     6.350      0.0000 ***
+rank corr, combined scores_6m     0.12675     0.01886     6.720      0.0000 ***
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+
+the full wide table behind the r style tables above is saved to
+score_orthogonality_summary.csv for reference and further plotting.
+
+
+Summary written, results1/transformer/score_orthogonality_summary.csv
+Monthly detail written, results1/transformer/score_orthogonality_monthly.csv
+
+model comparison, mlp benchmark vs dppt
+the mlp rank_corr is test only, its own saved figure. the dppt
+rank_corr is pooled across validation and test, per the window
+column, since the sharpe figures still come from eval_dual_path.py
+and remain test only, a full pooled portfolio simulation was not
+rerun here.
+                          model                   window  rank_corr  sharpe_ls  se_ls  sharpe_lo  n_obs_ls
+                  mlp benchmark                     test     0.1287     1.9472 0.5381     1.0271        10
+          fourier, base_6m only                 val+test     0.1327        NaN    NaN        NaN      <NA>
+         fourier, path2_6m only                 val+test     0.1187        NaN    NaN        NaN      <NA>
+    fourier, combined scores_6m val+test rc, test sharpe     0.1212     1.0494 0.3938     0.6782        10
+           linear, base_6m only                 val+test     0.1315        NaN    NaN        NaN      <NA>
+          linear, path2_6m only                 val+test     0.1381        NaN    NaN        NaN      <NA>
+     linear, combined scores_6m val+test rc, test sharpe     0.1402     2.2067 0.5861     1.6282        10
+      per_feature, base_6m only                 val+test     0.1252        NaN    NaN        NaN      <NA>
+     per_feature, path2_6m only                 val+test     0.1156        NaN    NaN        NaN      <NA>
+per_feature, combined scores_6m val+test rc, test sharpe     0.1223     1.9506 0.5387     1.9354        10
+         periodic, base_6m only                 val+test     0.1353        NaN    NaN        NaN      <NA>
+        periodic, path2_6m only                 val+test     0.1350        NaN    NaN        NaN      <NA>
+   periodic, combined scores_6m val+test rc, test sharpe     0.1389     1.9635 0.5411     2.2834        10
+              ple, base_6m only                 val+test     0.1147        NaN    NaN        NaN      <NA>
+             ple, path2_6m only                 val+test     0.1208        NaN    NaN        NaN      <NA>
+        ple, combined scores_6m val+test rc, test sharpe     0.1267     2.0595 0.5586     1.7884        10
+
+sharpe difference vs mlp benchmark, long short, scaled, z test
+                              estimate  std. error   t value    pr(>|t|)
+fourier, combined vs mlp      -0.89780     0.66679    -1.346      0.1782  
+linear, combined vs mlp        0.25946     0.79563     0.326      0.7443  
+per_feature, combined vs mlp     0.00335     0.76144     0.004      0.9965  
+periodic, combined vs mlp      0.01625     0.76309     0.021      0.9830  
+ple, combined vs mlp           0.11226     0.77564     0.145      0.8849  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+mlp comparison written, results1/transformer/score_orthogonality_mlp_comparison.csv
