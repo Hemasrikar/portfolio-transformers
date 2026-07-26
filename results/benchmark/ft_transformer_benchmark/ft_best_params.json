@@ -1,0 +1,30 @@
+{
+  "construction": "mean_split_softmax_cap_6m",
+  "target_column": "target_6m",
+  "best_params": {
+    "n_heads": 4,
+    "d_model_per_head": 8,
+    "d_ff_ratio": 4,
+    "n_layers": 2,
+    "dropout": 0.251181647470428,
+    "batch_size": 128,
+    "learning_rate": 0.0009630619328293385,
+    "weight_decay": 1.755294192817726e-06
+  },
+  "best_val_long_short_sharpe": 2.7308881754559655,
+  "best_trial_number": 16,
+  "best_trial_user_attrs": {
+    "best_epoch": 0,
+    "n_epochs_run": 9,
+    "best_val_rc": 0.11119972600075304,
+    "val_sharpe_long_only": 0.5966418006077822,
+    "d_model": 32,
+    "d_ff": 128,
+    "param_count": 44993
+  },
+  "n_trials_completed": 30,
+  "hpo_time_seconds": 27213.997297525406,
+  "optuna_seed": 24,
+  "torch_seed": 24,
+  "run_timestamp_utc": "2026-07-02T20:03:54"
+}
