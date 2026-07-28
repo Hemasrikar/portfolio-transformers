@@ -30,6 +30,11 @@ The features are removed, if their respective column has more than 30% missing d
  
 `notebooks/` contains country level analysis and summary plotting notebooks. `slurm/` holds the job scripts used to run training, tuning, and evaluation on a GPU cluster, with corresponding logs saved in `job-output/`. `plots/` and `results/` hold generated figures and metrics for each model.
 
+> The final HPC output files in the `job-output` are
+> - Transformer Hyperparameter Tunning: 1175497
+> - Transformer Training: 1175498
+> - Transformer Evaluation: 1177711
+
 > [!Note]
 > There are five branches including the main branch in this repository. 
 > - The `main` branch contains all the codebase of the final architecture after experimentation. 
