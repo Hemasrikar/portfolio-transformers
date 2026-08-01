@@ -1,0 +1,11 @@
+strategy,factor,n_variants,n_positive,n_negative,sign_agreement
+country_composite_long_only,mkt,5,5,0,5
+country_composite_long_only,value,5,5,0,5
+country_composite_long_only,smallcap,5,5,0,5
+country_composite_long_only,quality,5,5,0,5
+country_composite_long_only,momentum,5,0,5,5
+long_only,mkt,5,5,0,5
+long_only,value,5,5,0,5
+long_only,smallcap,5,4,1,4
+long_only,quality,5,3,2,3
+long_only,momentum,5,3,2,3
