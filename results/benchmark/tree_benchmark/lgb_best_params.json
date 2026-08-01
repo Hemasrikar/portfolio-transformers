@@ -1,21 +1,21 @@
 {
   "construction": "mean_split_softmax_cap_6m",
   "best_params": {
-    "n_estimators": 580,
+    "n_estimators": 192,
     "max_depth": 7,
-    "learning_rate": 0.19992050464904798,
-    "num_leaves": 39,
-    "subsample": 0.7444225415856232,
-    "colsample_bytree": 0.8439045941256622,
-    "min_child_samples": 30,
-    "reg_alpha": 0.0030655256872288168,
-    "reg_lambda": 0.00043814603393441945
+    "learning_rate": 0.06838973936800209,
+    "num_leaves": 64,
+    "subsample": 0.6804202771550869,
+    "colsample_bytree": 0.4021331026942422,
+    "min_child_samples": 29,
+    "reg_alpha": 0.0014437399425391306,
+    "reg_lambda": 0.0037515604876097487
   },
-  "best_value": 2.6873249230956784,
-  "best_trial_number": 0,
+  "best_value": 2.1302555497399926,
+  "best_trial_number": 31,
   "best_trial_user_attrs": {
-    "val_sharpe_long_only": 0.6308377755776454
+    "val_sharpe_long_only": 0.6885727755328711
   },
   "n_trials_completed": 50,
-  "hpo_time_seconds": 1337.8720240592957
+  "hpo_time_seconds": 724.3551547527313
 }

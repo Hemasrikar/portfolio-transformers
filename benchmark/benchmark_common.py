@@ -9,7 +9,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import optuna
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, rankdata
 
 
 # shared across all benchmark scripts so a fix made here applies everywhere
@@ -318,28 +318,30 @@ NON_FEATURE_COLS = {
 	'ret', 'ret_exc', 'ret_local',
 	'me', 'me_company', 'prc', 'prc_local', 'prc_high', 'prc_low',
 	'dolvol', 'shares', 'tvol',
+	'enterprise_value', 'book_equity', 'assets', 'sales', 'net_income',
+	'intrinsic_value',
 }
 
 
-def load_universe(data_path, ret_col_1m, ret_col, cfg, store_r1m = False):
-	"""Load the EM parquet universe, build the horizon_months cumulative
-	forward target, and rank normalise each cross section to [-0.5, 0.5]
-	with missing values imputed to zero. Returns feature_cols, all_months,
-	sorted_dates."""
+def load_universe(
+	data_path, ret_col_1m, ret_col, cfg, train_end, store_r1m = False,
+	missing_col_threshold = 0.30, row_missing_threshold = 1.0 / 3.0,
+):
+	train_end = pd.Timestamp(train_end)
 	schema = pq.read_schema(data_path)
 	non_feature = NON_FEATURE_COLS | {ret_col_1m}
-	feature_cols = [
+	candidate_cols = [
 		c for c in schema.names
 		if c not in non_feature
 		and pa.types.is_floating(schema.field(c).type)
 		and '_lag' not in c
 	]
-	print(f'feature columns selected: {len(feature_cols)}')
+	print(f'candidate feature columns: {len(candidate_cols)}')
 
-	needed = list(dict.fromkeys([c for c in ['id', 'eom', 'excntry', ret_col_1m] + feature_cols if c in schema.names]))
+	needed = list(dict.fromkeys([c for c in ['id', 'eom', 'excntry', ret_col_1m] + candidate_cols if c in schema.names]))
 	table = pq.read_table(data_path, columns = needed)
 	cast_fields = [
-		field.with_type(pa.float32()) if field.name in feature_cols and pa.types.is_float64(field.type) else field
+		field.with_type(pa.float32()) if field.name in candidate_cols and pa.types.is_float64(field.type) else field
 		for field in table.schema
 	]
 	table = table.cast(pa.schema(cast_fields))
@@ -348,15 +350,36 @@ def load_universe(data_path, ret_col_1m, ret_col, cfg, store_r1m = False):
 	del table
 	gc.collect()
 	df['eom'] = pd.to_datetime(df['eom'])
-	df[ret_col_1m] = df[ret_col_1m].clip(lower = cfg.ret_clip_low, upper = cfg.ret_clip_high)
+
+	# column level missingness filter, computed on the train period only
+	# so no information from val or test leaks into feature selection
+	train_mask = df['eom'] <= train_end
+	null_rates = df.loc[train_mask, candidate_cols].isnull().mean()
+	feature_cols = [c for c in candidate_cols if null_rates[c] <= missing_col_threshold]
+	print(f'feature columns retained after missingness filter: {len(feature_cols)} of {len(candidate_cols)}')
+
+	# row level missingness filter on the retained columns
+	n_before = len(df)
+	row_miss_frac = df[feature_cols].isnull().mean(axis = 1)
+	df = df.loc[row_miss_frac <= row_missing_threshold].reset_index(drop = True)
+	print(f'rows retained after row missingness filter: {df.shape[0]:,} of {n_before:,}')
+
+	# winsorise the one month return at train period percentiles only,
+	# then apply those fixed bounds across the full sample
+	ret_train = df.loc[df['eom'] <= train_end, ret_col_1m].dropna()
+	lo = float(ret_train.quantile(0.001))
+	hi = float(ret_train.quantile(0.999))
+	n_clipped = int(((df[ret_col_1m] < lo) | (df[ret_col_1m] > hi)).sum())
+	df[ret_col_1m] = df[ret_col_1m].clip(lower = lo, upper = hi)
+	print(f'winsorised {ret_col_1m} at [{lo:.4f}, {hi:.4f}] (train-period thresholds), {n_clipped:,} observations clipped')
 
 	print(f'loaded: {df.shape[0]:,} rows, {len(feature_cols)} characteristic columns')
 	print(f'date range: {df["eom"].min().date()} to {df["eom"].max().date()}')
 
 	# horizon_months cumulative forward target: compound the next
 	# horizon_months one month forward returns per firm, requiring the
-	# whole block to be present, then clip to a wider band than the one
-	# month return since the compounded return has fatter tails
+	# whole block to be present. No separate clip is applied to the
+	# compounded target
 	df = df.sort_values(['id', 'eom']).reset_index(drop = True)
 	shifted = np.stack([
 		df.groupby('id', sort = False)[ret_col_1m].shift(-k).to_numpy(dtype = np.float64)
@@ -365,7 +388,6 @@ def load_universe(data_path, ret_col_1m, ret_col, cfg, store_r1m = False):
 	valid_block = np.isfinite(shifted).all(axis = 1)
 	cum = np.where(valid_block, np.prod(1.0 + shifted, axis = 1) - 1.0, np.nan)
 	df[ret_col] = cum.astype(np.float32)
-	df[ret_col] = df[ret_col].clip(lower = cfg.ret_clip_low * 2.0, upper = cfg.ret_clip_high * 2.0)
 
 	retained = int(np.isfinite(cum).sum())
 	print(f'cumulative target retained: {retained:,} of {len(df):,} rows ({100.0 * retained / len(df):.2f}%)')
@@ -379,15 +401,22 @@ def load_universe(data_path, ret_col_1m, ret_col, cfg, store_r1m = False):
 	for eom in sorted_eoms:
 		month = df[df['eom'] == eom]
 		month = month[month[ret_col].notna()]
-		if len(month) < cfg.min_stocks:
+		n = len(month)
+		if n < cfg.min_stocks:
 			continue
 
-		x = np.zeros((len(month), n_feat), dtype = np.float32)
-		for j, col in enumerate(feature_cols):
-			vals = month[col].astype(np.float64).to_numpy()
-			valid = np.isfinite(vals)
-			if valid.sum() > 1:
-				x[valid, j] = pd.Series(vals[valid]).rank(pct = True).to_numpy(dtype = np.float32) - 0.5
+		if n > 1:
+			vals_block = month[feature_cols].to_numpy(dtype = np.float64, copy = True)
+			col_medians = np.nanmedian(vals_block, axis = 0)
+			nan_rows, nan_cols = np.where(np.isnan(vals_block))
+			vals_block[nan_rows, nan_cols] = col_medians[nan_cols]
+			ranks = rankdata(vals_block, method = 'average', axis = 0) - 1
+			x = (ranks / (n - 1) - 0.5).astype(np.float32)
+			residual_nan = np.isnan(x)
+			if residual_nan.any():
+				x[residual_nan] = 0.0
+		else:
+			x = np.zeros((n, n_feat), dtype = np.float32)
 
 		entry = {
 			'ids': month['id'].to_numpy(),

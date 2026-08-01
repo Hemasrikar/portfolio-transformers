@@ -48,7 +48,7 @@ optuna_seed = 24
 torch_seed = 24
 
 
-feature_cols, all_months, sorted_dates = load_universe(data_path, ret_col_1m, ret_col, cfg, store_r1m = True)
+feature_cols, all_months, sorted_dates = load_universe(data_path, ret_col_1m, ret_col, cfg, train_end, store_r1m = True)
 train_dates, val_dates, test_dates = make_splits(sorted_dates, train_end, val_end)
 print(f'train: {len(train_dates)} months, val: {len(val_dates)} months, test: {len(test_dates)} months')
 

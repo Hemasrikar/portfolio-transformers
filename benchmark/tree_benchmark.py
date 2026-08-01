@@ -73,7 +73,7 @@ optuna_seed = 24
 n_hpo_months = 36
 
 
-feature_cols, all_months, sorted_dates = load_universe(data_path, ret_col_1m, ret_col, cfg)
+feature_cols, all_months, sorted_dates = load_universe(data_path, ret_col_1m, ret_col, cfg, train_end)
 train_dates, val_dates, test_dates = make_splits(sorted_dates, train_end, val_end)
 print(f'train: {len(train_dates)} months, val: {len(val_dates)} months, test: {len(test_dates)} months')
 
