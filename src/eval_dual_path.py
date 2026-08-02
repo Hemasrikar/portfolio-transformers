@@ -1752,7 +1752,13 @@ for variant_name in all_results:
 
         all_test_dates = [test_ds.monthly_data[i]["eom"] for i in range(len(test_ds))]
         rebal_dates = all_test_dates[::rebal_freq]
-        monthly_dates = all_test_dates
+        # target_1m is aliased from ret_exc_lead1m in load_dataset, which on a row
+        # dated eom holds the excess return earned in the following month. the
+        # monthly simulations therefore return, at position i, the return earned in
+        # the month after all_test_dates[i]. we advance each label by one month so
+        # the recorded date is the month the return was actually earned, which is
+        # what any join against an externally dated series requires
+        monthly_dates = [pd.Timestamp(d) + pd.offsets.MonthEnd(1) for d in all_test_dates]
 
         block = {
             "long_only": compute_portfolio_metrics_extended(lo_returns, periods_per_year, dates=rebal_dates),

@@ -1,5 +1,6 @@
 import gc
 import json
+import logging
 import math
 import sys
 import warnings
@@ -19,6 +20,8 @@ from torch.utils.data import Dataset
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+logger = logging.getLogger(__name__)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -338,12 +341,14 @@ def _differentiable_long_short_return(scores, returns, valid_mask):
     valid_returns = returns[valid_mask]
     n_valid = valid_scores.shape[0]
     if n_valid < 10:
-        return torch.tensor(0.0, device=scores.device, requires_grad=True)
+        logger.warning("_differentiable_long_short_return: only %d valid firms, skipping step", n_valid)
+        return torch.tensor(0.0, device=scores.device)
     mean_score = valid_scores.mean()
     long_mask = valid_scores > mean_score
     short_mask = ~long_mask
     if long_mask.sum() == 0 or short_mask.sum() == 0:
-        return torch.tensor(0.0, device=scores.device, requires_grad=True)
+        logger.warning("_differentiable_long_short_return: empty leg, long=%d short=%d, skipping step", int(long_mask.sum()), int(short_mask.sum()))
+        return torch.tensor(0.0, device=scores.device)
     long_logits = valid_scores[long_mask] - mean_score
     short_logits = mean_score - valid_scores[short_mask]
     long_w = F.softmax(long_logits, dim=0)
@@ -358,7 +363,8 @@ def compute_msrr_loss(output, targets, valid_masks, config):
     target = targets["target_6m"]
     valid = valid_masks["target_6m"]
     if valid.sum() < 10:
-        return torch.tensor(0.0, device=device_, requires_grad=True)
+        logger.warning("compute_msrr_loss: only %d valid target_6m firms this batch, skipping step", int(valid.sum()))
+        return torch.tensor(0.0, device=device_)
     r_pf = _differentiable_long_short_return(output["scores_6m"], target, valid)
     r_base = _differentiable_long_short_return(output["base_6m"], target, valid)
     r_path2 = _differentiable_long_short_return(output["path2_6m"], target, valid)

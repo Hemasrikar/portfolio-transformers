@@ -207,11 +207,13 @@ def run_preprocessing(cfg):
         ret = df['ret_exc'].dropna()
         print(f"After rescaling, mean {ret.mean():.6f}, std {ret.std():.6f}")
 
-    lo = ret.quantile(0.001)
-    hi = ret.quantile(0.999)
+    train_mask_ret = df['eom'] <= pd.Timestamp(cfg.train_end)
+    ret_train = df.loc[train_mask_ret, 'ret_exc'].dropna()
+    lo = ret_train.quantile(0.001)
+    hi = ret_train.quantile(0.999)
     n_clipped = ((df['ret_exc'] < lo) | (df['ret_exc'] > hi)).sum()
     df['ret_exc'] = df['ret_exc'].clip(lo, hi)
-    print(f"Winsorised ret_exc at [{lo:.4f}, {hi:.4f}],{n_clipped:,} observations clipped ({n_clipped / len(df):.2%})")
+    print(f"Winsorised ret_exc at [{lo:.4f}, {hi:.4f}] (train-period thresholds),{n_clipped:,} observations clipped ({n_clipped / len(df):.2%})")
 
     df = compute_return_targets(df, forward_horizons)
     for h in forward_horizons:

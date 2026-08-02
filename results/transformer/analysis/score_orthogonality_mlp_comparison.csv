@@ -1,0 +1,17 @@
+model,rank_corr,sharpe_ls,se_ls,sharpe_lo,n_obs_ls
+mlp benchmark,0.1287,1.9472,0.5381,1.0271,10
+"fourier, base_6m only",0.1111,,,,
+"fourier, path2_6m only",0.1337,,,,
+"fourier, combined",0.1407,2.4404,0.6307,2.0071,10
+"linear, base_6m only",0.1377,,,,
+"linear, path2_6m only",0.1116,,,,
+"linear, combined",0.1154,1.58,0.4742,1.6068,10
+"per_feature, base_6m only",0.1176,,,,
+"per_feature, path2_6m only",0.1178,,,,
+"per_feature, combined",0.123,2.2822,0.6003,2.29,10
+"periodic, base_6m only",0.1165,,,,
+"periodic, path2_6m only",0.1092,,,,
+"periodic, combined",0.1133,2.036,0.5543,1.7385,10
+"ple, base_6m only",0.1428,,,,
+"ple, path2_6m only",0.1017,,,,
+"ple, combined",0.1056,1.033,0.3916,0.9338,10
