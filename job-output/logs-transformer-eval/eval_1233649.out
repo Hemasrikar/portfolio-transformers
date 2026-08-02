@@ -1,0 +1,389 @@
+K0 characteristics, 55
+K1 characteristics, 97
+K0 missingness flags, 55
+K1 missingness flags, 97
+Countries, 24
+Per year metrics  results1/transformer/per_year_fourier.csv  (88 rows)
+Per month metrics results1/transformer/per_month_fourier.csv  (480 rows)
+Holdings  results1/transformer/holdings_fourier.parquet  (737,676 rows)
+Leverage  results1/transformer/leverage_fourier.parquet  (40 rows)
+Metrics updated  results1/transformer/metrics_fourier.json
+Per year metrics  results1/transformer/per_year_linear.csv  (88 rows)
+Per month metrics results1/transformer/per_month_linear.csv  (480 rows)
+Holdings  results1/transformer/holdings_linear.parquet  (737,676 rows)
+Leverage  results1/transformer/leverage_linear.parquet  (40 rows)
+Metrics updated  results1/transformer/metrics_linear.json
+Per year metrics  results1/transformer/per_year_per_feature.csv  (88 rows)
+Per month metrics results1/transformer/per_month_per_feature.csv  (480 rows)
+Holdings  results1/transformer/holdings_per_feature.parquet  (737,676 rows)
+Leverage  results1/transformer/leverage_per_feature.parquet  (40 rows)
+Metrics updated  results1/transformer/metrics_per_feature.json
+Per year metrics  results1/transformer/per_year_periodic.csv  (88 rows)
+Per month metrics results1/transformer/per_month_periodic.csv  (480 rows)
+Holdings  results1/transformer/holdings_periodic.parquet  (737,676 rows)
+Leverage  results1/transformer/leverage_periodic.parquet  (40 rows)
+Metrics updated  results1/transformer/metrics_periodic.json
+Per year metrics  results1/transformer/per_year_ple.csv  (88 rows)
+Per month metrics results1/transformer/per_month_ple.csv  (480 rows)
+Holdings  results1/transformer/holdings_ple.parquet  (737,676 rows)
+Leverage  results1/transformer/leverage_ple.parquet  (40 rows)
+Metrics updated  results1/transformer/metrics_ple.json
+
+Variant comparison (test set columns are reported; validation set
+columns are the selection criteria):
+Scaled = volatility-targeted with leverage overlay.
+Unscaled = flat position sizing, no leverage.
+
+variant        val_corr  val_sr_ls   corr_6m    sr_lo  sr_lo_u    sr_ls  sr_ls_u   vol_ls  vol_ls_u
+fourier          0.1220     2.8758    0.1131   2.0071   1.7904   2.4404   2.3376   0.1081    0.2984  *sharpe
+linear           0.1299     1.3075    0.1059   1.6068   1.4275   1.5800   1.5789   0.1468    0.4406
+per_feature      0.1289     1.9155    0.1099   2.2900   1.9495   2.2822   2.0902   0.0938    0.2810
+periodic         0.1376     1.9674    0.1011   1.7385   1.5556   2.0360   2.0676   0.1256    0.3295  *corr
+ple              0.1070     1.4526    0.0993   0.9338   1.1542   1.0330   1.7408   0.3016    0.3790
+Best by validation rank correlation, periodic
+Best by validation long short Sharpe ratio, fourier
+
+Monthly-frequency Sharpe ratios (6m rebalance, target_1m monthly returns):
+variant         sr_lo_mo   sr_lo_mo_u   sr_ls_mo   sr_ls_mo_u
+fourier           2.4410       2.3796     2.4647       2.5952
+linear            2.4832       2.5375     2.0997       2.0962
+per_feature       2.4074       2.3415     1.6673       1.8428
+periodic          2.2346       2.1910     2.3833       2.4979
+ple               1.8012       1.7951     1.2717       1.2717
+Detailed test set portfolio metrics for fourier (best by validation long short sharpe):
+scaled means with volatility overlay leverage, unscaled means no leverage, flat tc.
+
+long_only:
+  cumulative_return              scaled    0.9934   unscaled    4.4678
+  annualised_return              scaled    0.1479   unscaled    0.4046
+  annualised_vol                 scaled    0.0723   unscaled    0.2166
+  sharpe_ratio                   scaled    2.0071   unscaled    1.7904
+  max_drawdown                   scaled    0.0027   unscaled    0.0040
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_short:
+  cumulative_return              scaled    2.3818   unscaled   16.8052
+  annualised_return              scaled    0.2759   unscaled    0.7787
+  annualised_vol                 scaled    0.1081   unscaled    0.2984
+  sharpe_ratio                   scaled    2.4404   unscaled    2.3376
+  max_drawdown                   scaled    0.0056   unscaled    0.0088
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_only:
+  cumulative_return              scaled    0.7753   unscaled    1.3686
+  annualised_return              scaled    0.1216   unscaled    0.1882
+  annualised_vol                 scaled    0.0951   unscaled    0.1271
+  sharpe_ratio                   scaled    1.2808   unscaled    1.4650
+  max_drawdown                   scaled    0.0083   unscaled    0.0028
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_short:
+  cumulative_return              scaled    1.0382   unscaled    1.9517
+  annualised_return              scaled    0.1531   unscaled    0.2417
+  annualised_vol                 scaled    0.1303   unscaled    0.1224
+  sharpe_ratio                   scaled    1.1853   unscaled    1.9193
+  max_drawdown                   scaled    0.0651   unscaled    0.0509
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_only_monthly:
+  cumulative_return              scaled    1.4345   unscaled    4.4462
+  annualised_return              scaled    0.1948   unscaled    0.4035
+  annualised_vol                 scaled    0.0745   unscaled    0.1489
+  sharpe_ratio                   scaled    2.4410   unscaled    2.3796
+  max_drawdown                   scaled    0.0470   unscaled    0.0787
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+long_short_monthly:
+  cumulative_return              scaled    2.4149   unscaled   24.0585
+  annualised_return              scaled    0.2784   unscaled    0.9045
+  annualised_vol                 scaled    0.1028   unscaled    0.2679
+  sharpe_ratio                   scaled    2.4647   unscaled    2.5952
+  max_drawdown                   scaled    0.1151   unscaled    0.2401
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_only_monthly:
+  cumulative_return              scaled    0.9808   unscaled    1.6623
+  annualised_return              scaled    0.1465   unscaled    0.2163
+  annualised_vol                 scaled    0.0767   unscaled    0.1138
+  sharpe_ratio                   scaled    1.8290   unscaled    1.7905
+  max_drawdown                   scaled    0.0569   unscaled    0.0968
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_short_monthly:
+  cumulative_return              scaled    1.7250   unscaled    2.2162
+  annualised_return              scaled    0.2220   unscaled    0.2632
+  annualised_vol                 scaled    0.1084   unscaled    0.1274
+  sharpe_ratio                   scaled    1.9179   unscaled    1.9128
+  max_drawdown                   scaled    0.0564   unscaled    0.0730
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+Detailed test set portfolio metrics for linear:
+scaled means with volatility overlay leverage, unscaled means no leverage, flat tc.
+
+long_only:
+  cumulative_return              scaled    0.8619   unscaled    3.7001
+  annualised_return              scaled    0.1324   unscaled    0.3628
+  annualised_vol                 scaled    0.0815   unscaled    0.2497
+  sharpe_ratio                   scaled    1.6068   unscaled    1.4275
+  max_drawdown                   scaled    0.0047   unscaled    0.0141
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_short:
+  cumulative_return              scaled    1.8821   unscaled   14.5175
+  annualised_return              scaled    0.2358   unscaled    0.7305
+  annualised_vol                 scaled    0.1468   unscaled    0.4406
+  sharpe_ratio                   scaled    1.5800   unscaled    1.5789
+  max_drawdown                   scaled    0.0032   unscaled    0.0095
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_only:
+  cumulative_return              scaled    0.6960   unscaled    1.3861
+  annualised_return              scaled    0.1114   unscaled    0.1900
+  annualised_vol                 scaled    0.0751   unscaled    0.1237
+  sharpe_ratio                   scaled    1.4753   unscaled    1.5175
+  max_drawdown                   scaled    0.0067   unscaled    0.0033
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_short:
+  cumulative_return              scaled    0.8749   unscaled    2.0457
+  annualised_return              scaled    0.1340   unscaled    0.2495
+  annualised_vol                 scaled    0.1170   unscaled    0.1497
+  sharpe_ratio                   scaled    1.1603   unscaled    1.6363
+  max_drawdown                   scaled    0.1147   unscaled    0.0887
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_only_monthly:
+  cumulative_return              scaled    2.2893   unscaled    5.7727
+  annualised_return              scaled    0.2689   unscaled    0.4661
+  annualised_vol                 scaled    0.0987   unscaled    0.1578
+  sharpe_ratio                   scaled    2.4832   unscaled    2.5375
+  max_drawdown                   scaled    0.0459   unscaled    0.0929
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+long_short_monthly:
+  cumulative_return              scaled    2.3239   unscaled   25.5466
+  annualised_return              scaled    0.2715   unscaled    0.9266
+  annualised_vol                 scaled    0.1188   unscaled    0.3497
+  sharpe_ratio                   scaled    2.0997   unscaled    2.0962
+  max_drawdown                   scaled    0.1483   unscaled    0.4017
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_only_monthly:
+  cumulative_return              scaled    0.9978   unscaled    1.5918
+  annualised_return              scaled    0.1484   unscaled    0.2098
+  annualised_vol                 scaled    0.0765   unscaled    0.1086
+  sharpe_ratio                   scaled    1.8563   unscaled    1.8209
+  max_drawdown                   scaled    0.0554   unscaled    0.0881
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_short_monthly:
+  cumulative_return              scaled    1.4025   unscaled    1.9585
+  annualised_return              scaled    0.1916   unscaled    0.2423
+  annualised_vol                 scaled    0.1125   unscaled    0.1427
+  sharpe_ratio                   scaled    1.6240   unscaled    1.6028
+  max_drawdown                   scaled    0.1095   unscaled    0.1450
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+Detailed test set portfolio metrics for per_feature:
+scaled means with volatility overlay leverage, unscaled means no leverage, flat tc.
+
+long_only:
+  cumulative_return              scaled    1.1977   unscaled    5.1276
+  annualised_return              scaled    0.1706   unscaled    0.4370
+  annualised_vol                 scaled    0.0725   unscaled    0.2122
+  sharpe_ratio                   scaled    2.2900   unscaled    1.9495
+  max_drawdown                   scaled    0.0027   unscaled    0.0028
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_short:
+  cumulative_return              scaled    1.7212   unscaled   10.7886
+  annualised_return              scaled    0.2217   unscaled    0.6379
+  annualised_vol                 scaled    0.0938   unscaled    0.2810
+  sharpe_ratio                   scaled    2.2822   unscaled    2.0902
+  max_drawdown                   scaled    0.0030   unscaled    0.0059
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_only:
+  cumulative_return              scaled    1.4002   unscaled    2.0053
+  annualised_return              scaled    0.1914   unscaled    0.2462
+  annualised_vol                 scaled    0.1644   unscaled    0.1254
+  sharpe_ratio                   scaled    1.1750   unscaled    1.9027
+  max_drawdown                   scaled    0.0072   unscaled    0.0026
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_short:
+  cumulative_return              scaled    0.8549   unscaled    2.3059
+  annualised_return              scaled    0.1315   unscaled    0.2702
+  annualised_vol                 scaled    0.0671   unscaled    0.1333
+  sharpe_ratio                   scaled    1.9285   unscaled    1.9598
+  max_drawdown                   scaled    0.0167   unscaled    0.0185
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_only_monthly:
+  cumulative_return              scaled    1.7910   unscaled    4.7636
+  annualised_return              scaled    0.2279   unscaled    0.4195
+  annualised_vol                 scaled    0.0875   unscaled    0.1567
+  sharpe_ratio                   scaled    2.4074   unscaled    2.3415
+  max_drawdown                   scaled    0.0417   unscaled    0.0748
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+long_short_monthly:
+  cumulative_return              scaled    1.2641   unscaled    7.7802
+  annualised_return              scaled    0.1775   unscaled    0.5442
+  annualised_vol                 scaled    0.1017   unscaled    0.2572
+  sharpe_ratio                   scaled    1.6673   unscaled    1.8428
+  max_drawdown                   scaled    0.1352   unscaled    0.2890
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_only_monthly:
+  cumulative_return              scaled    1.3673   unscaled    2.3551
+  annualised_return              scaled    0.1881   unscaled    0.2739
+  annualised_vol                 scaled    0.0784   unscaled    0.1111
+  sharpe_ratio                   scaled    2.2520   unscaled    2.2540
+  max_drawdown                   scaled    0.0338   unscaled    0.0510
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_short_monthly:
+  cumulative_return              scaled    2.2052   unscaled    2.1519
+  annualised_return              scaled    0.2623   unscaled    0.2581
+  annualised_vol                 scaled    0.1154   unscaled    0.1146
+  sharpe_ratio                   scaled    2.0929   unscaled    2.0781
+  max_drawdown                   scaled    0.0642   unscaled    0.0687
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+Detailed test set portfolio metrics for periodic (best by validation rank correlation):
+scaled means with volatility overlay leverage, unscaled means no leverage, flat tc.
+
+long_only:
+  cumulative_return              scaled    0.9056   unscaled    3.4541
+  annualised_return              scaled    0.1376   unscaled    0.3482
+  annualised_vol                 scaled    0.0781   unscaled    0.2183
+  sharpe_ratio                   scaled    1.7385   unscaled    1.5556
+  max_drawdown                   scaled    0.0028   unscaled    0.0030
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_short:
+  cumulative_return              scaled    2.2417   unscaled   15.4235
+  annualised_return              scaled    0.2652   unscaled    0.7502
+  annualised_vol                 scaled    0.1256   unscaled    0.3295
+  sharpe_ratio                   scaled    2.0360   unscaled    2.0676
+  max_drawdown                   scaled    0.0042   unscaled    0.0066
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_only:
+  cumulative_return              scaled    1.1210   unscaled    1.6481
+  annualised_return              scaled    0.1623   unscaled    0.2150
+  annualised_vol                 scaled    0.1342   unscaled    0.1541
+  sharpe_ratio                   scaled    1.2166   unscaled    1.3835
+  max_drawdown                   scaled    0.0078   unscaled    0.0026
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_short:
+  cumulative_return              scaled    1.4941   unscaled    1.9356
+  annualised_return              scaled    0.2006   unscaled    0.2403
+  annualised_vol                 scaled    0.1517   unscaled    0.1240
+  sharpe_ratio                   scaled    1.3242   unscaled    1.8861
+  max_drawdown                   scaled    0.0958   unscaled    0.0634
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_only_monthly:
+  cumulative_return              scaled    1.2617   unscaled    3.4806
+  annualised_return              scaled    0.1773   unscaled    0.3498
+  annualised_vol                 scaled    0.0748   unscaled    0.1431
+  sharpe_ratio                   scaled    2.2346   unscaled    2.1910
+  max_drawdown                   scaled    0.0579   unscaled    0.1206
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+long_short_monthly:
+  cumulative_return              scaled    2.2745   unscaled   21.0263
+  annualised_return              scaled    0.2677   unscaled    0.8560
+  annualised_vol                 scaled    0.1027   unscaled    0.2676
+  sharpe_ratio                   scaled    2.3833   unscaled    2.4979
+  max_drawdown                   scaled    0.1058   unscaled    0.2313
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_only_monthly:
+  cumulative_return              scaled    1.0752   unscaled    1.9710
+  annualised_return              scaled    0.1572   unscaled    0.2433
+  annualised_vol                 scaled    0.0763   unscaled    0.1181
+  sharpe_ratio                   scaled    1.9610   unscaled    1.9178
+  max_drawdown                   scaled    0.0478   unscaled    0.0849
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_short_monthly:
+  cumulative_return              scaled    1.9360   unscaled    2.1356
+  annualised_return              scaled    0.2404   unscaled    0.2568
+  annualised_vol                 scaled    0.1096   unscaled    0.1164
+  sharpe_ratio                   scaled    2.0366   unscaled    2.0381
+  max_drawdown                   scaled    0.0735   unscaled    0.0803
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+Detailed test set portfolio metrics for ple:
+scaled means with volatility overlay leverage, unscaled means no leverage, flat tc.
+
+long_only:
+  cumulative_return              scaled    0.6595   unscaled    1.7363
+  annualised_return              scaled    0.1066   unscaled    0.2230
+  annualised_vol                 scaled    0.1171   unscaled    0.1964
+  sharpe_ratio                   scaled    0.9338   unscaled    1.1542
+  max_drawdown                   scaled    0.0132   unscaled    0.0397
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_short:
+  cumulative_return              scaled    2.7537   unscaled   13.5901
+  annualised_return              scaled    0.3028   unscaled    0.7093
+  annualised_vol                 scaled    0.3016   unscaled    0.3790
+  sharpe_ratio                   scaled    1.0330   unscaled    1.7408
+  max_drawdown                   scaled    0.0024   unscaled    0.0073
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_only:
+  cumulative_return              scaled    1.1828   unscaled    1.9537
+  annualised_return              scaled    0.1690   unscaled    0.2419
+  annualised_vol                 scaled    0.1354   unscaled    0.1405
+  sharpe_ratio                   scaled    1.2521   unscaled    1.6796
+  max_drawdown                   scaled    0.0090   unscaled    0.0030
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+country_composite_long_short:
+  cumulative_return              scaled    1.0965   unscaled    2.3176
+  annualised_return              scaled    0.1596   unscaled    0.2711
+  annualised_vol                 scaled    0.0773   unscaled    0.1161
+  sharpe_ratio                   scaled    2.0206   unscaled    2.2429
+  max_drawdown                   scaled    0.0076   unscaled    0.0068
+  n_rebalances                   scaled   10.0000   unscaled   10.0000
+
+long_only_monthly:
+  cumulative_return              scaled    1.1675   unscaled    2.0203
+  annualised_return              scaled    0.1673   unscaled    0.2474
+  annualised_vol                 scaled    0.0886   unscaled    0.1288
+  sharpe_ratio                   scaled    1.8012   unscaled    1.7951
+  max_drawdown                   scaled    0.0790   unscaled    0.1218
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+long_short_monthly:
+  cumulative_return              scaled    1.2765   unscaled    7.6659
+  annualised_return              scaled    0.1788   unscaled    0.5401
+  annualised_vol                 scaled    0.1376   unscaled    0.4127
+  sharpe_ratio                   scaled    1.2717   unscaled    1.2717
+  max_drawdown                   scaled    0.1270   unscaled    0.3862
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_only_monthly:
+  cumulative_return              scaled    1.3304   unscaled    2.4617
+  annualised_return              scaled    0.1844   unscaled    0.2819
+  annualised_vol                 scaled    0.0771   unscaled    0.1161
+  sharpe_ratio                   scaled    2.2477   unscaled    2.2165
+  max_drawdown                   scaled    0.0357   unscaled    0.0607
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+country_composite_long_short_monthly:
+  cumulative_return              scaled    1.8255   unscaled    2.4573
+  annualised_return              scaled    0.2309   unscaled    0.2816
+  annualised_vol                 scaled    0.1174   unscaled    0.1426
+  sharpe_ratio                   scaled    1.8418   unscaled    1.8273
+  max_drawdown                   scaled    0.1094   unscaled    0.1421
+  n_rebalances                   scaled   60.0000   unscaled   60.0000
+
+Combined portfolio metrics for all variants written to results1/transformer/all_variants_portfolio_metrics.csv
+Wide format combined portfolio metrics written to results1/transformer/all_variants_portfolio_metrics_wide.csv

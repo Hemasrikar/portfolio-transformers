@@ -1,0 +1,284 @@
+K0 characteristics, 55
+K1 characteristics, 97
+Validation months, 60
+Test months, 60
+Pooled months, validation plus test, 120
+Variant, fourier, seeds, 5
+Variant, linear, seeds, 5
+Variant, per_feature, seeds, 5
+Variant, periodic, seeds, 5
+Variant, ple, seeds, 5
+fourier
+window   n  b1_base  b1_full  b2_full  rc_base  rc_combined
+   val  60   0.0419   0.0378 0.0092     0.1009       0.1422
+  test  54   0.0436   0.0352 0.0166 *   0.1111       0.1407
+pooled 114   0.0427   0.0366 0.0127 *   0.1057       0.1415
+
+      regime  n  b1_base    b2_full  rc_base  rc_combined
+    vol_high 57   0.0558   0.0053     0.1306       0.1353
+     vol_low 57   0.0296 0.0202 ***   0.0808       0.1478
+period_early 40   0.0374 0.0209 ***   0.1049       0.1731
+  period_mid 40   0.0569   0.0075     0.1155       0.1299
+ period_late 34   0.0322   0.0092     0.0952       0.1180
+
+fourier, by country, pooled, at least 12 months
+country   n  b1_base    b2_full  rc_base  rc_combined
+    ARE 114   0.0335   0.0111     0.1978       0.2117
+    BRA 114   0.0409 0.0389 ***   0.1090       0.1888
+    CHL 114   0.0306  -0.0081     0.1250       0.1151
+    CHN 114   0.0060 0.0176 ***   0.0372       0.1096
+    COL 114   0.0286   0.0072     0.1282       0.1447
+    EGY 114   0.0486  -0.0057     0.1809       0.1593
+    GRC 114   0.0479   0.0019     0.1166       0.1333
+    IDN 114   0.0554   0.0030     0.1638       0.1795
+    IND 114   0.0489  0.0183 **   0.0660       0.1178
+    KOR 114   0.0229 0.0397 ***   0.1414       0.1889
+    KWT 114   0.0218  -0.0141     0.0721       0.0799
+    MEX 114   0.0129  0.0142 **   0.0206       0.0509
+    MYS 114   0.0333   0.0176 .   0.1036       0.1748
+    PER 114   0.0408   0.0031     0.0896       0.0927
+    PHL 114   0.0276   0.0099     0.1350       0.1721
+    POL 114   0.0502   0.0103     0.1252       0.1792
+    QAT 114   0.0120  -0.0115     0.1578       0.1512
+    SAU 114   0.0255  -0.0015     0.1406       0.1420
+    THA 114   0.0359   0.0071     0.1688       0.1873
+    TUR 114   0.0241   0.0137 *   0.0963       0.1195
+    TWN 114   0.0252   0.0060     0.1376       0.1634
+    ZAF 114   0.0358   0.0050     0.0826       0.0944
+    HUN  72   0.0458   0.0252     0.1734       0.2878
+
+fourier, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.46948          NA        NA          NA  
+entropy ratio vs uniform (1)     0.99758     0.00002  -119.226      0.0000 ***
+missingness excess vs zero    -0.00065     0.00006   -11.814      0.0000 ***
+r squared, base only           0.01968          NA        NA          NA  
+r squared, full                0.02423          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+linear
+window   n  b1_base  b1_full   b2_full  rc_base  rc_combined
+   val  60   0.0352   0.0286  0.0082     0.1261       0.1438
+  test  54   0.0361   0.0457 -0.0121     0.1377       0.1154
+pooled 114   0.0356   0.0367 -0.0014     0.1316       0.1303
+
+      regime  n  b1_base   b2_full  rc_base  rc_combined
+    vol_high 57   0.0419 -0.0206 *   0.1375       0.1120
+     vol_low 57   0.0294  0.0178 *   0.1256       0.1487
+period_early 40   0.0419  0.0170 *   0.1635       0.1817
+  period_mid 40   0.0408 -0.0152     0.1212       0.1083
+ period_late 34   0.0221 -0.0069     0.1062       0.0959
+
+linear, by country, pooled, at least 12 months
+country   n  b1_base   b2_full  rc_base  rc_combined
+    ARE 114   0.0237  0.0104     0.1635       0.1839
+    BRA 114   0.0508  0.0143     0.1636       0.1785
+    CHL 114   0.0087  0.0025     0.0642       0.0864
+    CHN 114   0.0188 -0.0014     0.1300       0.1208
+    COL 114   0.0205  0.0071     0.0961       0.1293
+    EGY 114   0.0224  0.0174     0.1545       0.1560
+    GRC 114   0.0217  0.0020     0.0825       0.1096
+    IDN 114   0.0338 -0.0049     0.1636       0.1601
+    IND 114   0.0454  0.0032     0.1105       0.1190
+    KOR 114   0.0355 -0.0035     0.1895       0.1864
+    KWT 114   0.0063 -0.0155     0.0563       0.0801
+    MEX 114   0.0138  0.0166 *   0.0217       0.0589
+    MYS 114   0.0284  0.0070     0.1532       0.1636
+    PER 114   0.0292  0.0157     0.0590       0.0810
+    PHL 114   0.0209  0.0111 *   0.1398       0.1564
+    POL 114   0.0338 -0.0007     0.1618       0.1729
+    QAT 114  -0.0002  0.0026     0.1210       0.1329
+    SAU 114   0.0148 -0.0092     0.1089       0.1091
+    THA 114   0.0231  0.0136 *   0.1701       0.1711
+    TUR 114   0.0272 -0.0132     0.1307       0.1203
+    TWN 114   0.0188  0.0029     0.1438       0.1430
+    ZAF 114   0.0187  0.0094     0.0626       0.0818
+    HUN  72   0.0399 -0.0001     0.2556       0.2410
+
+linear, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.77990          NA        NA          NA  
+entropy ratio vs uniform (1)     0.76916     0.00179  -128.936      0.0000 ***
+missingness excess vs zero    -0.00540     0.00061    -8.802      0.0000 ***
+r squared, base only           0.02021          NA        NA          NA  
+r squared, full                0.02534          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+per_feature
+window   n  b1_base  b1_full    b2_full  rc_base  rc_combined
+   val  60   0.0310   0.0216 0.0239 ***   0.0994       0.1307
+  test  54   0.0391   0.0320 0.0136 ***   0.1176       0.1230
+pooled 114   0.0348   0.0265 0.0190 ***   0.1080       0.1270
+
+      regime  n  b1_base    b2_full  rc_base  rc_combined
+    vol_high 57   0.0414 0.0172 ***   0.1258       0.1264
+     vol_low 57   0.0282 0.0208 ***   0.0903       0.1277
+period_early 40   0.0334 0.0278 ***   0.1176       0.1540
+  period_mid 40   0.0458  0.0149 **   0.1136       0.1145
+ period_late 34   0.0236   0.0136 *   0.0902       0.1101
+
+per_feature, by country, pooled, at least 12 months
+country   n  b1_base    b2_full  rc_base  rc_combined
+    ARE 114   0.0186  0.0223 **   0.1089       0.1833
+    BRA 114   0.0320 0.0502 ***   0.0942       0.1490
+    CHL 114   0.0089   0.0089     0.0180       0.0649
+    CHN 114   0.0131   0.0071     0.1084       0.1019
+    COL 114   0.0153   0.0042     0.0374       0.0611
+    EGY 114   0.0215   0.0246 *   0.1448       0.1421
+    GRC 114   0.0261  0.0226 **   0.0333       0.1144
+    IDN 114   0.0294   0.0264 *   0.1184       0.1598
+    IND 114   0.0453   0.0193 *   0.0611       0.1025
+    KOR 114   0.0220 0.0404 ***   0.1547       0.1769
+    KWT 114   0.0092  -0.0016     0.0100       0.0741
+    MEX 114   0.0079   0.0121     0.0036       0.0051
+    MYS 114   0.0211  0.0202 **   0.0947       0.1402
+    PER 114   0.0201   0.0193 *   0.0183       0.0398
+    PHL 114   0.0168   0.0153 .   0.0972       0.1396
+    POL 114   0.0416   0.0126     0.1316       0.1651
+    QAT 114   0.0121  -0.0055     0.1094       0.1210
+    SAU 114   0.0196   0.0108     0.0921       0.1048
+    THA 114   0.0185 0.0218 ***   0.1182       0.1425
+    TUR 114   0.0267   0.0119     0.1204       0.1267
+    TWN 114   0.0165  0.0150 **   0.1246       0.1343
+    ZAF 114   0.0189   0.0213 *   0.0256       0.0617
+    HUN  72   0.0385   0.0208     0.2194       0.2256
+
+per_feature, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.44642          NA        NA          NA  
+entropy ratio vs uniform (1)     0.99887     0.00001   -84.418      0.0000 ***
+missingness excess vs zero    -0.00054     0.00003   -21.727      0.0000 ***
+r squared, base only           0.01496          NA        NA          NA  
+r squared, full                0.01888          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+periodic
+window   n  b1_base  b1_full  b2_full  rc_base  rc_combined
+   val  60   0.0389   0.0344 0.0065     0.1200       0.1397
+  test  54   0.0338   0.0329 0.0010     0.1165       0.1133
+pooled 114   0.0365   0.0337 0.0039     0.1183       0.1272
+
+      regime  n  b1_base   b2_full  rc_base  rc_combined
+    vol_high 57   0.0443 -0.0088     0.1343       0.1173
+     vol_low 57   0.0288 0.0166 **   0.1023       0.1371
+period_early 40   0.0426  0.0137 *   0.1438       0.1689
+  period_mid 40   0.0418 -0.0047     0.1086       0.1067
+ period_late 34   0.0230  0.0024     0.0998       0.1023
+
+periodic, by country, pooled, at least 12 months
+country   n  b1_base    b2_full  rc_base  rc_combined
+    ARE 114   0.0261   0.0179 *   0.1689       0.1969
+    BRA 114   0.0517  0.0375 **   0.1549       0.1864
+    CHL 114   0.0157   0.0055     0.0821       0.0937
+    CHN 114   0.0137   0.0067     0.1055       0.1019
+    COL 114   0.0275  -0.0043     0.1315       0.1140
+    EGY 114   0.0319  -0.0029     0.1544       0.1374
+    GRC 114   0.0323  -0.0006     0.0859       0.1199
+    IDN 114   0.0371   0.0063     0.1393       0.1600
+    IND 114   0.0454   0.0033     0.0854       0.1105
+    KOR 114   0.0243 0.0441 ***   0.1517       0.1746
+    KWT 114   0.0072  -0.0072     0.0323       0.0745
+    MEX 114   0.0163   0.0172 *   0.0301       0.0312
+    MYS 114   0.0234   0.0186 .   0.1148       0.1448
+    PER 114   0.0339   0.0002     0.0802       0.0621
+    PHL 114   0.0216   0.0121     0.1312       0.1451
+    POL 114   0.0365  -0.0046     0.1550       0.1686
+    QAT 114   0.0069  -0.0079     0.1239       0.1403
+    SAU 114   0.0206   0.0028     0.1048       0.1120
+    THA 114   0.0233   0.0136 .   0.1293       0.1447
+    TUR 114   0.0208   0.0075     0.1106       0.1159
+    TWN 114   0.0183 0.0141 ***   0.1261       0.1363
+    ZAF 114   0.0250   0.0115     0.0644       0.0752
+    HUN  72   0.0447   0.0123     0.2431       0.2524
+
+periodic, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.68516          NA        NA          NA  
+entropy ratio vs uniform (1)     0.99691     0.00004   -71.854      0.0000 ***
+missingness excess vs zero    -0.00070     0.00002   -31.541      0.0000 ***
+r squared, base only           0.01854          NA        NA          NA  
+r squared, full                0.02194          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+ple
+window   n  b1_base  b1_full   b2_full  rc_base  rc_combined
+   val  60   0.0395   0.0415 -0.0051     0.1293       0.1085
+  test  54   0.0439   0.0454 -0.0042     0.1428       0.1056
+pooled 114   0.0416   0.0434 -0.0046     0.1357       0.1071
+
+      regime  n  b1_base   b2_full  rc_base  rc_combined
+    vol_high 57   0.0486 -0.0150 *   0.1415       0.0904
+     vol_low 57   0.0346  0.0057 *   0.1300       0.1238
+period_early 40   0.0436  0.0054     0.1571       0.1395
+  period_mid 40   0.0525 -0.0212 *   0.1403       0.0855
+ period_late 34   0.0264  0.0030     0.1053       0.0943
+
+ple, by country, pooled, at least 12 months
+country   n  b1_base    b2_full  rc_base  rc_combined
+    ARE 114   0.0212   0.0113 .   0.1415       0.1786
+    BRA 114   0.0519   0.0159     0.1583       0.1726
+    CHL 114   0.0102   0.0023     0.0476       0.0705
+    CHN 114   0.0194   0.0009     0.1200       0.1104
+    COL 114   0.0133 0.0236 ***   0.0656       0.1282
+    EGY 114   0.0358  -0.0062     0.1594       0.1332
+    GRC 114   0.0343   0.0040     0.0803       0.1199
+    IDN 114   0.0394   0.0025     0.1717       0.1687
+    IND 114   0.0500   0.0072     0.0984       0.1009
+    KOR 114   0.0372  -0.0084 *   0.1927       0.1840
+    KWT 114   0.0154  -0.0184 .   0.0488       0.0726
+    MEX 114   0.0132  0.0202 **   0.0270       0.0373
+    MYS 114   0.0351  -0.0073     0.1569       0.1495
+    PER 114   0.0294   0.0154     0.0515       0.0665
+    PHL 114   0.0261   0.0046     0.1384       0.1566
+    POL 114   0.0463  -0.0082     0.1694       0.1651
+    QAT 114   0.0072  -0.0029     0.0808       0.1173
+    SAU 114   0.0149   0.0045     0.1144       0.1116
+    THA 114   0.0304  -0.0019     0.1861       0.1637
+    TUR 114   0.0393  -0.0120     0.1580       0.1361
+    TWN 114   0.0246  -0.0091 *   0.1598       0.1448
+    ZAF 114   0.0259   0.0060     0.0764       0.0847
+    HUN  72   0.0495   0.0001     0.2695       0.2420
+
+ple, pooled diagnostics
+                              estimate  std. error   t value    pr(>|t|)
+corr, base_6m vs path2_6m      0.48566          NA        NA          NA  
+entropy ratio vs uniform (1)     0.43441     0.00177  -319.538      0.0000 ***
+missingness excess vs zero    -0.01059     0.00079   -13.399      0.0000 ***
+r squared, base only           0.02267          NA        NA          NA  
+r squared, full                0.02597          NA        NA          NA  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+summary written, results1/transformer/analysis/score_orthogonality_summary.csv, 40 rows across the val, test, and pooled windows
+monthly detail written, results1/transformer/analysis/score_orthogonality_monthly.csv
+country summary written, results1/transformer/analysis/score_orthogonality_country.csv, 115 rows
+country monthly detail written, results1/transformer/analysis/score_orthogonality_country_monthly.csv
+
+model comparison, mlp benchmark vs dppt, test window only
+                     model  rank_corr  sharpe_ls  se_ls  sharpe_lo  n_obs_ls
+             mlp benchmark     0.1287     1.9472 0.5381     1.0271        10
+     fourier, base_6m only     0.1111        NaN    NaN        NaN      <NA>
+    fourier, path2_6m only     0.1337        NaN    NaN        NaN      <NA>
+         fourier, combined     0.1407     2.4404 0.6307     2.0071        10
+      linear, base_6m only     0.1377        NaN    NaN        NaN      <NA>
+     linear, path2_6m only     0.1116        NaN    NaN        NaN      <NA>
+          linear, combined     0.1154     1.5800 0.4742     1.6068        10
+ per_feature, base_6m only     0.1176        NaN    NaN        NaN      <NA>
+per_feature, path2_6m only     0.1178        NaN    NaN        NaN      <NA>
+     per_feature, combined     0.1230     2.2822 0.6003     2.2900        10
+    periodic, base_6m only     0.1165        NaN    NaN        NaN      <NA>
+   periodic, path2_6m only     0.1092        NaN    NaN        NaN      <NA>
+        periodic, combined     0.1133     2.0360 0.5543     1.7385        10
+         ple, base_6m only     0.1428        NaN    NaN        NaN      <NA>
+        ple, path2_6m only     0.1017        NaN    NaN        NaN      <NA>
+             ple, combined     0.1056     1.0330 0.3916     0.9338        10
+
+sharpe difference vs mlp benchmark, long short, scaled, z test
+                              estimate  std. error   t value    pr(>|t|)
+fourier, combined vs mlp       0.49321     0.82906     0.595      0.5519  
+linear, combined vs mlp       -0.36719     0.71720    -0.512      0.6087  
+per_feature, combined vs mlp     0.33498     0.80621     0.415      0.6778  
+periodic, combined vs mlp      0.08879     0.77254     0.115      0.9085  
+ple, combined vs mlp          -0.91421     0.66551    -1.374      0.1695  
+signif. codes, 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+mlp comparison written, results1/transformer/analysis/score_orthogonality_mlp_comparison.csv
