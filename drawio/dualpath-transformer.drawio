@@ -1,6 +1,6 @@
 <mxfile host="Electron">
   <diagram name="Page-1" id="d-xjQhuckSDacYgthoh-">
-    <mxGraphModel dx="1996" dy="1500" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="1" shadow="0">
+    <mxGraphModel dx="1373" dy="1031" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="1" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -12,7 +12,7 @@
             <mxPoint x="1335" y="219" as="targetPoint" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="G6QB6RhEOKrtuXhVk-Rt-26" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeWidth=2;strokeColor=#b85450;" value="&lt;span style=&quot;font-size: 16px;&quot;&gt;Linear&lt;/span&gt;&lt;div&gt;&lt;div&gt;&lt;div&gt;&lt;div&gt;&lt;div style=&quot;padding-bottom: 0px; margin-top: 6px;&quot;&gt;\(a_{i} = Y \lambda\)&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" vertex="1">
+        <mxCell id="G6QB6RhEOKrtuXhVk-Rt-26" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeWidth=2;strokeColor=#b85450;" value="&lt;span style=&quot;font-size: 16px;&quot;&gt;Linear&lt;/span&gt;&lt;div&gt;&lt;div&gt;&lt;div&gt;&lt;div&gt;&lt;div style=&quot;padding-bottom: 0px; margin-top: 6px;&quot;&gt;\(\mathrm{g}_{i,t}^{(2)} = Y \lambda\)&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" vertex="1">
           <mxGeometry height="50" width="170" x="1250" y="241" as="geometry" />
         </mxCell>
         <mxCell id="G6QB6RhEOKrtuXhVk-Rt-33" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeWidth=2;strokeColor=#d6b656;" value="&lt;span style=&quot;font-size: 16px;&quot;&gt;Summation over Heads&lt;/span&gt;" vertex="1">
