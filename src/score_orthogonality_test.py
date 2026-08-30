@@ -2,10 +2,7 @@
 # path 1. for every month, base_6m and path2_6m are regressed against
 # target_6m, standardised within the month, once alone and once together.
 # monthly estimates are pooled with fama-macbeth averaging and newey-west
-# standard errors (5 lags, for the six month target's overlap). validation
-# and test are pooled for extra power but also reported separately, since
-# validation drives early stopping and is not a clean holdout. reads trained
-# checkpoints only, does not touch evaluation script.
+# standard errors (5 lags, for the six month target's overlap). 
 
 import json
 import math
@@ -22,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file as safetensors_load
 from scipy.stats import norm
+from scipy.stats import spearmanr
 from scipy.stats import t as student_t
 from torch.utils.data import Dataset
 
@@ -409,7 +407,7 @@ def significance_stars(p):
     bins = [-np.inf, 0.001, 0.01, 0.05, 0.1, np.inf]
     labels = ["***", "**", "*", ".", " "]
     stars = pd.cut([p], bins=bins, labels=labels)[0]
-    return str(stars) if isinstance(stars, str) else " "
+    return stars if pd.notna(stars) else " "
 
 
 def implied_std_error(mean, t_stat):
@@ -435,12 +433,6 @@ def sharpe_diff_ztest(sharpe_a, se_a, sharpe_b, se_b):
     return sharpe_a - sharpe_b, se_diff, z, p_value
 
 
-def rank_corr(a, b):
-    ar = pd.Series(np.asarray(a, dtype=np.float64)).rank().to_numpy()
-    br = pd.Series(np.asarray(b, dtype=np.float64)).rank().to_numpy()
-    return float(np.corrcoef(ar, br)[0, 1])
-
-
 def newey_west_tstat(values, dates, max_lag_months):
     # lag here is a real calendar gap in months, not an array position, since
     # a regime filter such as vol_high can drop months unevenly and leave the
@@ -449,17 +441,17 @@ def newey_west_tstat(values, dates, max_lag_months):
     # gives the same answer as a position based newey west correction, so one
     # function covers both the window and the regime splits correctly.
     x = np.asarray(values, dtype=np.float64)
-    date_arr = pd.to_datetime(pd.Series(dates)).to_numpy()
+    dates = pd.to_datetime(pd.Series(dates)).reset_index(drop=True)
     mask = ~np.isnan(x)
     x = x[mask]
-    date_arr = date_arr[mask]
+    dates = dates[mask].reset_index(drop=True)
     n = len(x)
     if n < 3:
         return float("nan"), float("nan"), float("nan")
 
-    order = np.argsort(date_arr)
+    order = np.argsort(dates.values)
     x = x[order]
-    months = date_arr[order].astype("datetime64[M]").astype(np.int64)
+    months = (dates.dt.year.values[order] * 12 + dates.dt.month.values[order]).astype(np.int64)
 
     mean_x = float(x.mean())
     demeaned = x - mean_x
@@ -496,7 +488,7 @@ def cross_sectional_regression(target, base, path2, valid, min_firms):
     p2_std = (p2 - p2.mean()) / (p2.std() + 1e-12)
 
     pearson_corr = float((b_std * p2_std).sum() / n)
-    rank_corr_bp = rank_corr(b, p2)
+    rank_corr = float(spearmanr(b, p2).statistic)
 
     ss_tot = float(((y - y.mean()) ** 2).sum())
     if ss_tot <= 1e-12:
@@ -520,7 +512,7 @@ def cross_sectional_regression(target, base, path2, valid, min_firms):
         "b2_full": float(coef_full[2]),
         "r2_full": r2_full,
         "corr_base_path2": pearson_corr,
-        "rank_corr_base_path2": rank_corr_bp,
+        "rank_corr_base_path2": rank_corr,
     }
 
 
@@ -551,11 +543,11 @@ def _attention_diagnostics(models, k0, k1, k0_miss, k1_miss, country_ids, min_fi
         attn_stack = []
         for model in models:
             y = y_input
-            block_attn = []
+            attn_last = None
             for block in model.path2_net.blocks:
                 y, attn_w = block(y)
-                block_attn.append(attn_w)
-            attn_stack.append(block_attn[-1].mean(dim=0))
+                attn_last = attn_w
+            attn_stack.append(attn_last.mean(dim=0))
         attn_avg = torch.stack(attn_stack).mean(dim=0).cpu().numpy()
 
         n = attn_avg.shape[0]
@@ -594,8 +586,7 @@ def pooled_stats(sub, lags):
         return None
 
     def nw(col, offset=0.0):
-        col_values = np.asarray(sub[col], dtype=np.float64) - offset
-        mean, t, p = newey_west_tstat(col_values, sub["eom"], lags)
+        mean, t, p = newey_west_tstat(sub[col].values - offset, sub["eom"], lags)
         return mean + offset, t, p
 
     b1_base, t_b1_base, p_b1_base = nw("b1_base")
@@ -719,9 +710,9 @@ for variant_name in all_results:
                 continue
 
             valid_idx_month = np.where(valid)[0]
-            result["rank_corr_base"] = rank_corr(base_scores[valid_idx_month], target[valid_idx_month])
-            result["rank_corr_path2"] = rank_corr(path2_scores[valid_idx_month], target[valid_idx_month])
-            result["rank_corr_combined"] = rank_corr(combined_scores[valid_idx_month], target[valid_idx_month])
+            result["rank_corr_base"] = float(spearmanr(base_scores[valid_idx_month], target[valid_idx_month]).statistic)
+            result["rank_corr_path2"] = float(spearmanr(path2_scores[valid_idx_month], target[valid_idx_month]).statistic)
+            result["rank_corr_combined"] = float(spearmanr(combined_scores[valid_idx_month], target[valid_idx_month]).statistic)
 
             attn_diag = _attention_diagnostics(variant_model_list, k0, k1, k0_miss, k1_miss, cids, cfg.min_firms_attention)
             result["entropy_ratio"] = attn_diag["entropy_ratio"] if attn_diag is not None else float("nan")
@@ -746,9 +737,9 @@ for variant_name in all_results:
                 if result_c is None:
                     continue
                 idx_c = np.where(country_valid)[0]
-                result_c["rank_corr_base"] = rank_corr(base_scores[idx_c], target[idx_c])
-                result_c["rank_corr_path2"] = rank_corr(path2_scores[idx_c], target[idx_c])
-                result_c["rank_corr_combined"] = rank_corr(combined_scores[idx_c], target[idx_c])
+                result_c["rank_corr_base"] = float(spearmanr(base_scores[idx_c], target[idx_c]).statistic)
+                result_c["rank_corr_path2"] = float(spearmanr(path2_scores[idx_c], target[idx_c]).statistic)
+                result_c["rank_corr_combined"] = float(spearmanr(combined_scores[idx_c], target[idx_c]).statistic)
                 result_c["entropy_ratio"] = float("nan")
                 result_c["missingness_excess"] = float("nan")
                 result_c["variant"] = variant_name
