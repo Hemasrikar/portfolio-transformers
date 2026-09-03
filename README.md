@@ -1,6 +1,8 @@
 # Transformers for Asset Pricing
 
-This repository implements the Dual Path Portfolio Transformer, based a cross sectional equity model trained directly on a Maximum Sharpe Ratio Regression objective on the JKP Emerging Markets factor panel.
+![Status](https://img.shields.io/badge/status-complete-brightgreen)
+
+This repository implements the Dual Path Portfolio Transformer, based a cross sectional equity model trained directly on a Maximum Sharpe Ratio Regression objective on the [JKP Emerging Markets](https://jkpfactors.com) factor panel.
  
 ## Model
  
@@ -31,9 +33,9 @@ The features are removed, if their respective column has more than 30% missing d
 `notebooks/` contains country level analysis and summary plotting notebooks. `slurm/` holds the job scripts used to run training, tuning, and evaluation on a GPU cluster, with corresponding logs saved in `job-output/`. `plots/` and `results/` hold generated figures and metrics for each model.
 
 > The final HPC output files in the `job-output` are
-> - Transformer Hyperparameter Tunning: 1233645
-> - Transformer Training: 1233648
-> - Transformer Evaluation: 1233649
+> - Transformer Hyperparameter Tunning: 1241896
+> - Transformer Training: 1241897
+> - Transformer Evaluation: 1241898
 > - Transformer Analysis: 1233650
 
 > [!Note]
@@ -45,4 +47,4 @@ The features are removed, if their respective column has more than 30% missing d
 > - The `thesis\resources` contain diagrams for the dissertation.
 
 > [!CAUTION]
-> The data_processing notebook is run on a device with 32 GB ram. During the data process, the python has consumed more than ~29 GB data and complete 32 GB ram was utilised with ~10 GB swap memory as the complete dataset is loaded onto your ram. So, with that in mind, caution need be maintained when runnig the notebook on device with less resources.
+> The data_processing script is run on a device with 32 GB ram. During the data processing, the python has consumed more than ~29 GB ram with ~10 GB swap memory.
