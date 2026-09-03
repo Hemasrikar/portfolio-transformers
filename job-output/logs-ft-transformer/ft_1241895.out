@@ -1,0 +1,39 @@
+torch, 2.12.1+cu126
+cuda available, True
+device, cuda
+device name, NVIDIA L40
+mixed precision, enabled
+run timestamp utc, 2026-08-08T01:51:11
+construction, mean_split_softmax_cap_6m
+periods_per_year, 2.0
+n_vol_periods, 6
+feature columns selected, 304
+train rows, 1,707,212
+val rows, 914,776
+test rows, 1,115,424
+train target_6m non-null, 1,694,197 (99.2%)
+val target_6m non-null, 906,982 (99.1%)
+test target_6m non-null, 988,553 (88.6%)
+x_train shape, (1694197, 304)
+training data saved, ft_training_data.csv, 1,707,212 rows
+training metadata saved, ft_training_metadata.json
+test inputs saved, ft_test_inputs.csv, 1,115,424 rows
+best params loaded, {'n_heads': 4, 'd_model_per_head': 16, 'd_ff_ratio': 4, 'n_layers': 3, 'dropout': 0.29573551650088187, 'batch_size': 256, 'learning_rate': 0.0008031262934397595, 'weight_decay': 4.936846067689196e-06}
+final model trained in 1473.7 s
+parameter count, 238,913
+weights saved, ft_weights.safetensors
+rank corr val, 0.1372
+rank corr test, 0.1564
+val and test predictions saved
+long short vol, sharpe = 1.3076, ann_ret = 23.50%, ann_vol = 17.97%
+long only  vol, sharpe = 1.0004, ann_ret = 8.06%, ann_vol = 8.06%
+summary saved
+
+FT Transformer Benchmark, EM Universe, mean split capped softmax, 6m rebalance
+ portfolio  scaling  rc_test  sharpe     se  ann_ret  ann_vol  cagr  max_dd  n_obs
+long_short unscaled   0.1564  1.8915 0.5281    17.22     9.10 17.60    0.36     10
+long_short   scaled   0.1564  1.3076 0.4307    23.50    17.97 23.59    0.70     10
+ long_only unscaled   0.1564  0.9328 0.3788    12.79    13.71 12.40    7.64     10
+ long_only   scaled   0.1564  1.0004 0.3874     8.06     8.06  7.94    4.54     10
+cumulative wealth plot saved
+training diagnostics plot saved

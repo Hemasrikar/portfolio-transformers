@@ -1,0 +1,33 @@
+device cuda
+k0 55 k1 97 total 152
+86 retained characteristics not in Table 1 (Other Factors)
+['chcsho_1m', 'chcsho_3m', 'chcsho_6m', 'eqnpo_1m', 'eqnpo_3m', 'eqnpo_6m', 'ret_2_0', 'ret_3_0', 'ret_6_0', 'ret_9_0', 'ret_12_0', 'ret_18_1', 'ret_24_1', 'ret_24_12', 'ret_36_1', 'ret_36_12', 'rvol_252d', 'rvolhl_21d', 'beta_21d', 'beta_252d', 'lt_gr1', 'be_gr1', 'cash_gr1a', 'debtst_gr1a', 'ap_gr1a', 'debtlt_gr1a', 'fna_gr1a', 'ebitda_gr1a', 'ebit_gr1a', 'ni_gr1a', 'nix_gr1a', 'dp_gr1a', 'ocf_gr1a', 'dltnetis_gr1a', 'dbnetis_gr1a', 'xido_at', 'ebitda_sale', 'pi_sale', 'ni_sale', 'nix_sale', 'ocf_sale', 'ebitda_at', 'ebit_at', 'fi_at', 'ni_at', 'nix_be', 'ocf_be', 'ebitda_bev', 'fi_bev', 'ebitda_ppen', 'dltnetis_at', 'dstnetis_at', 'be_bev', 'debt_bev', 'cash_bev', 'debtlt_bev', 'debtst_bev', 'ebitda_debt', 'ocf_debt', 'cash_lt', 'debtst_debt', 'debtlt_debt', 'lt_ppen', 'debtlt_be', 'debt_at', 'debt_be', 'ebit_int', 'sale_be', 'cash_me', 'ebitda_me', 'ebit_me', 'ope_me', 'nix_me', 'at_mev', 'ppen_mev', 'be_mev', 'cash_mev', 'sale_mev', 'ebit_mev', 'ocf_mev', 'debt_mev', 'debtlt_mev', 'debtst_mev', 'dltnetis_mev', 'dstnetis_mev', 'dbnetis_mev']
+test months 60
+variants ['fourier', 'linear', 'per_feature', 'periodic', 'ple']
+fourier seeds 5
+linear seeds 5
+per_feature seeds 5
+periodic seeds 5
+ple seeds 5
+done fourier
+done linear
+done per_feature
+done periodic
+done ple
+computed and saved path1_characteristic_weights.csv, 760 rows
+done fourier
+done linear
+done per_feature
+done periodic
+done ple
+computed and saved longonly_gradient_attribution.csv, 760 rows
+saved analysis_metadata.json
+
+all analyses complete. files written to results1/transformer/analysis
+  path1_characteristic_weights.csv
+  longonly_gradient_attribution.csv
+  analysis_metadata.json
+
+theme labels are not stored in the csvs. apply them when plotting using
+the jkp_theme_map field of analysis_metadata.json, so changing the theme
+grouping never requires rerunning this script.
