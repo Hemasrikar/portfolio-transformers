@@ -2,11 +2,11 @@
 
 ![Status](https://img.shields.io/badge/status-complete-brightgreen)
 
-This repository implements the Dual Path Portfolio Transformer, based a cross sectional equity model trained directly on a Maximum Sharpe Ratio Regression objective on the [JKP Emerging Markets](https://jkpfactors.com) factor panel.
+This project was part of my MSc dissertation and was conducted in association with Rothko Investment Strategies. I developed a **Dual Path Portfolio Transformer (DPPT)**, a cross-sectional equity model trained directly using a **Maximum Sharpe Ratio Regression objective** on the [JKP Emerging Markets](https://jkpfactors.com) factor panel.
  
 ## Model
  
-The Dual Path Portfolio Transformer scores each firm for a six month holding horizon using two complementary paths. Path 1 scores every firm independently through a shared per firm head applied to market based (K0) and fundamentals (K1) characteristic blocks. Path 2 groups firms by country and, when the cross section is large enough, passes them through a small transformer with sparse top k attention, finally adding a learned adjustment to the Path 1 score.
+The Dual Path Portfolio Transformer (DPPT) scores each firm for a **six-month holding horizon** using two complementary paths. Path 1 scores each firm independently through a shared per-firm head applied to market-based (**K0**) and fundamental (**K1**) characteristic blocks. Path 2 groups firms by country and, when the cross-section is sufficiently large, passes them through a compact transformer with **sparse top-k attention**, producing a learned adjustment that is added to the Path 1 score.
 
 ---
 
@@ -48,3 +48,8 @@ The features are removed, if their respective column has more than 30% missing d
 
 > [!CAUTION]
 > The data_processing script is run on a device with 32 GB ram. During the data processing, the python has consumed more than ~29 GB ram with ~10 GB swap memory.
+
+---
+## Transformer Architecture
+
+![Dual Path Portfolio Transformer](https://github.com/Hemasrikar/portfolio-transformers/blob/thesis/resources/dualapproach-transformer.png)
