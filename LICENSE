@@ -1,0 +1,28 @@
+Copyright (c) 2026 Hema Srikar Ankem
+
+This repository contains a Master of Science dissertation in Mathematical Finance together with its accompanying source code. The two components are licensed separately as follows.
+
+1. Dissertation text, figures and tables
+
+The written dissertation, including all figures, tables and supplementary documents, is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+
+You are free to share and adapt this material for any purpose, provided that appropriate credit is given to the author, a link to the license is provided, and any changes made are indicated.
+
+Suggested citation:
+Hema Srikar Ankem (2026). Master of Science Dissertation in Mathematical Finance.
+
+Full license text: https://creativecommons.org/licenses/by/4.0/legalcode
+
+2. Source code
+
+All source code in this repository is licensed under the MIT License.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+3. Third party data
+
+Any third party datasets referenced or used in this work remain subject to the terms of their original providers and are not covered by this license.
